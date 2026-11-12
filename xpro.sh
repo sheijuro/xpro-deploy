@@ -2518,7 +2518,7 @@ action_uninstall() {
     msg_ok "3x-ui и nginx удалены." "3x-ui and nginx removed."
 
     if confirml "Удалить и сам скрипт ($0) вместе с командой xpro?" "Remove the script itself ($0) together with the xpro command?" n; then
-        rm -f -- "$0" "$XPRO_BIN" "$LANG_FILE"
+        rm -f -- "$0" "$XPRO_BIN" "${XPRO_BIN}.bak" "$LANG_FILE"
         msg_ok "Скрипт удалён." "Script removed."
         exit 0
     fi
@@ -2619,6 +2619,12 @@ show_menu() {
         say "  \e[1;32m[7]\e[0m Показать доступы (панель, дашборд, подписки)" "  \e[1;32m[7]\e[0m Show access details (panel, dashboard, subscriptions)"
     fi
     echo -e "  \e[1;32m[8]\e[0m Язык / Language"
+    if [[ -n "$UPDATE_VERSION" ]]; then
+        say "  \e[1;33m[9]\e[0m Обновить скрипт — доступна версия \e[1;33m${UPDATE_VERSION}\e[0m" \
+            "  \e[1;33m[9]\e[0m Update the script — version \e[1;33m${UPDATE_VERSION}\e[0m is available"
+    else
+        say "  \e[1;32m[9]\e[0m Проверить обновления скрипта" "  \e[1;32m[9]\e[0m Check for script updates"
+    fi
     say "  \e[1;37m[0]\e[0m Выход" "  \e[1;37m[0]\e[0m Exit"
     echo
 }
@@ -2636,6 +2642,14 @@ install_xpro() {
     [[ "$self" == "$XPRO_BIN" ]] && return 0
     cmp -s "$self" "$XPRO_BIN" 2>/dev/null && return 0
 
+    # Не откатываем: если команда xpro уже новее запущенного файла (обновилась через меню), оставляем её
+    local binver
+    binver=$(grep -m1 -oP '^XPRO_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' "$XPRO_BIN" 2>/dev/null)
+    if [[ -n "$binver" && "$binver" != "$XPRO_VERSION" \
+          && "$(printf '%s\n' "$XPRO_VERSION" "$binver" | sort -V | tail -1)" == "$binver" ]]; then
+        return 0
+    fi
+
     local what
     what=$(L "установлена" "installed")
     [[ -f "$XPRO_BIN" ]] && what=$(L "обновлена" "updated")
@@ -2646,6 +2660,65 @@ install_xpro() {
     else
         msg_wrn "Не удалось скопировать скрипт в ${XPRO_BIN}." "Failed to copy the script to ${XPRO_BIN}."
     fi
+}
+
+# ─── Обновление скрипта ──────────────────────────────────────────────────────
+# При запуске скрипт сверяет свою версию с той, что лежит в репозитории, и только сообщает
+# о новой. Сама замена файла — отдельным пунктом меню и только после подтверждения.
+XPRO_UPDATE_URL="https://raw.githubusercontent.com/sheijuro/x-ui-custom-deploy/main/xpro.sh"
+UPDATE_VERSION=""          # номер новой версии, если она есть
+
+xpro_fetch() {             # $1 — куда сохранить ("-" = в stdout); короткий таймаут, чтобы меню не ждало сеть
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time "${2:-5}" -o "$1" "$XPRO_UPDATE_URL" 2>/dev/null
+    else
+        wget -q -T "${2:-5}" -t 1 -O "$1" "$XPRO_UPDATE_URL" 2>/dev/null
+    fi
+}
+
+check_update() {
+    local remote
+    UPDATE_VERSION=""
+    remote=$(xpro_fetch - | grep -m1 -oP '^XPRO_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+')
+    [[ -n "$remote" && "$remote" != "$XPRO_VERSION" ]] || return 0
+    # Новее ли версия в репозитории, чем текущая
+    if [[ "$(printf '%s\n' "$XPRO_VERSION" "$remote" | sort -V | tail -1)" == "$remote" ]]; then
+        UPDATE_VERSION="$remote"
+    fi
+}
+
+action_update() {
+    msg_inf "Проверка обновлений..." "Checking for updates..."
+    check_update
+    if [[ -z "$UPDATE_VERSION" ]]; then
+        msg_ok "Установлена последняя версия (${XPRO_VERSION}) либо репозиторий недоступен." \
+               "You have the latest version (${XPRO_VERSION}), or the repository is unreachable."
+        return
+    fi
+    msg_inf "Доступна версия ${UPDATE_VERSION} (у вас ${XPRO_VERSION})." \
+            "Version ${UPDATE_VERSION} is available (you have ${XPRO_VERSION})."
+    confirml "Обновить скрипт? Установленная 3x-ui и её настройки не затрагиваются." \
+             "Update the script? The installed 3x-ui and its settings are not affected." y || return
+
+    local tmp
+    tmp=$(mktemp)
+    if ! xpro_fetch "$tmp" 60; then
+        rm -f "$tmp"
+        msg_wrn "Не удалось скачать новую версию." "Failed to download the new version."; return
+    fi
+    # Не заменяем рабочий скрипт чем попало: это должен быть наш bash-скрипт без синтаксических ошибок
+    if [[ "$(head -c 11 "$tmp")" != '#!/bin/bash' ]] || ! grep -q '^XPRO_VERSION=' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        msg_wrn "Скачанный файл не прошёл проверку — обновление отменено." \
+                "The downloaded file failed validation — update cancelled."; return
+    fi
+    [[ -f "$XPRO_BIN" ]] && cp -a "$XPRO_BIN" "${XPRO_BIN}.bak"
+    install -m 755 "$tmp" "$XPRO_BIN"
+    rm -f "$tmp"
+    msg_ok "Скрипт обновлён до ${UPDATE_VERSION}. Прежняя версия сохранена в ${XPRO_BIN}.bak. Перезапуск..." \
+           "The script was updated to ${UPDATE_VERSION}. The previous version is kept in ${XPRO_BIN}.bak. Restarting..."
+    sleep 1
+    exec "$XPRO_BIN"
 }
 
 main_menu() {
@@ -2665,6 +2738,7 @@ main_menu() {
             6) action_uninstall; pause ;;
             7) action_access;    pause ;;
             8) choose_lang ;;
+            9) action_update;    pause ;;
             0) exit 0 ;;
             *) msg_wrn "Нет такого пункта." "No such item."; sleep 1 ;;
         esac
@@ -2673,4 +2747,5 @@ main_menu() {
 
 load_lang || choose_lang       # язык спрашивается один раз, при первом запуске
 install_xpro
+check_update                   # только проверка: о новой версии сообщит строка [9] в меню
 main_menu
