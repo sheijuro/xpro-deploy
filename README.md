@@ -71,8 +71,4 @@ sudo xpro
 - [Start Bootstrap](https://github.com/StartBootstrap) — шаблоны сайта-заглушки, MIT
 - [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) — база GeoIP, CC BY 4.0
 
-## 👤 Автор и лицензия
 
-Copyright (c) 2026 ВашНик
-
-Распространяется по лицензии GPL-3.0, см. файл [LICENSE](LICENSE).
