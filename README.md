@@ -20,7 +20,7 @@
 Для установки выполните в терминале сервера (под root):
 
 ```bash
-wget -O x-ui-custom.sh https://raw.githubusercontent.com/sheijuro/xpro-secure-vpn/main/x-ui-custom.sh
+wget -O x-ui-custom.sh https://raw.githubusercontent.com/sheijuro/x-ui-custom-deploy/main/x-ui-custom.sh
 sudo bash x-ui-custom.sh
 ```
 
