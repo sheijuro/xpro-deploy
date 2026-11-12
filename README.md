@@ -1,5 +1,3 @@
-# x-ui-custom-deploy
-custom 3x-ui
 # 🛡️ xpro-secure-vpn (3x-ui Custom Deploy)
 
 Профессиональный bash-скрипт-комбайн для максимально скрытной и безопасной установки VPN-панели [3x-ui](https://github.com/MHSanaei/3x-ui) на Debian. 
@@ -17,8 +15,8 @@ custom 3x-ui
 
 ## ⚙️ Установка и использование
 
-Для установки выполните:
+Для установки выполните в терминале сервера (под root):
 
 ```bash
-wget -O x-ui-custom.sh [https://raw.githubusercontent.com/ТВОЙ_НИК/ТВОЙ_РЕПОЗИТОРИЙ/main/x-ui-custom.sh](https://raw.githubusercontent.com/ТВОЙ_НИК/ТВОЙ_РЕПОЗИТОРИЙ/main/x-ui-custom.sh)
+wget -O x-ui-custom.sh [https://raw.githubusercontent.com/sheijuro/xpro-secure-vpn/main/x-ui-custom.sh](https://raw.githubusercontent.com/sheijuro/xpro-secure-vpn/main/x-ui-custom.sh)
 sudo bash x-ui-custom.sh
