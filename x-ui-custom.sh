@@ -1756,10 +1756,13 @@ check_os() {
     local id ver
     id=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
     ver=$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")
-    if [[ "$id" != "debian" || ! "$ver" =~ ^(12|13)$ ]]; then
-        msg_wrn "Скрипт рассчитан на Debian 12/13, обнаружено: ${id} ${ver}."
-        confirm "Продолжить на свой риск?" n || return 1
-    fi
+    # Поддерживаются системы с apt и свежей glibc (её требует бинарник 3x-ui)
+    case "${id}:${ver}" in
+        debian:12|debian:13)                      return 0 ;;
+        ubuntu:22.04|ubuntu:24.04|ubuntu:26.04)   return 0 ;;
+    esac
+    msg_wrn "Скрипт рассчитан на Debian 12/13 и Ubuntu 22.04/24.04/26.04, обнаружено: ${id} ${ver}."
+    confirm "Продолжить на свой риск?" n || return 1
 }
 
 collect_install_settings() {
