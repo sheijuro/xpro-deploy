@@ -19,14 +19,14 @@
 # Запуск:  sudo bash xpro.sh
 ###############################################################################
 
-[[ $EUID -ne 0 ]] && { echo "Запустите от root: sudo bash $0"; exit 1; }
+[[ $EUID -ne 0 ]] && { echo "Run as root / Запустите от root: sudo bash $0"; exit 1; }
 
 # UTF-8 локаль нужна для кириллицы в case-шаблонах и для эмодзи (C.UTF-8 есть в Debian всегда)
 export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.1.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.2.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -73,10 +73,38 @@ FAKE_SITES=(
 )
 
 # ─── Вывод ───────────────────────────────────────────────────────────────────
-msg_ok()  { echo -e "\e[1;32m[OK]\e[0m $*"; }
-msg_inf() { echo -e "\e[1;34m[..]\e[0m $*"; }
-msg_wrn() { echo -e "\e[1;33m[!!]\e[0m $*"; }
-die()     { echo -e "\e[1;31m[ОШИБКА]\e[0m $*" >&2; exit 1; }
+# Язык интерфейса: ru | en. Выбор сохраняется в файле и переживает переустановку.
+XLANG="ru"
+LANG_FILE="/etc/xpro-lang"
+
+# L "русский" "english" — строка на текущем языке (если перевода нет, остаётся русский)
+L() { if [[ $XLANG == en && -n "${2:-}" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+# say "русский" "english" — echo -e на текущем языке
+say() { echo -e "$(L "$@")"; }
+
+# Все сообщения принимают два аргумента: русский текст и английский
+msg_ok()  { echo -e "\e[1;32m[OK]\e[0m $(L "$@")"; }
+msg_inf() { echo -e "\e[1;34m[..]\e[0m $(L "$@")"; }
+msg_wrn() { echo -e "\e[1;33m[!!]\e[0m $(L "$@")"; }
+die()     { echo -e "\e[1;31m[$(L "ОШИБКА" "ERROR")]\e[0m $(L "$@")" >&2; exit 1; }
+
+load_lang() {
+    [[ -f "$LANG_FILE" ]] || return 1
+    XLANG=$(tr -dc 'a-z' < "$LANG_FILE")
+    [[ "$XLANG" == en ]] || XLANG="ru"
+}
+
+choose_lang() {
+    local c
+    echo
+    echo "  Язык / Language:"
+    echo "    1) Русский"
+    echo "    2) English"
+    read -rp "  [1]: " c
+    case "$c" in 2) XLANG="en" ;; *) XLANG="ru" ;; esac
+    echo "$XLANG" > "$LANG_FILE" 2>/dev/null
+}
 
 # ─── Ввод ────────────────────────────────────────────────────────────────────
 # ask VAR "вопрос" ["значение по умолчанию"]
@@ -101,7 +129,11 @@ confirm() {
     [[ "$ans" =~ ^[YyДд] ]]
 }
 
-pause() { echo; read -rp "Нажмите Enter для возврата в меню..." _; }
+# Двуязычные варианты: askl VAR "рус" "eng" [по умолчанию], confirml "рус" "eng" [y|n]
+askl()     { ask "$1" "$(L "$2" "$3")" "${4:-}"; }
+confirml() { confirm "$(L "$1" "$2")" "${3:-n}"; }
+
+pause() { echo; read -rp "$(L "Нажмите Enter для возврата в меню..." "Press Enter to return to the menu...")" _; }
 
 # sq "строка" — экранирование одинарных кавычек для SQL
 sq() { printf '%s' "${1//\'/\'\'}"; }
@@ -129,7 +161,8 @@ load_state() {
 # Пункты меню 2 и 3 работают только с установкой, сделанной этим скриптом
 require_install() {
     if ! load_state || [[ ! -f "$XUIDB" ]]; then
-        msg_wrn "Установка этого скрипта не найдена (${STATE_FILE}). Сначала выполните пункт [1]."
+        msg_wrn "Установка этого скрипта не найдена (${STATE_FILE}). Сначала выполните пункт [1]." \
+                "No installation made by this script was found (${STATE_FILE}). Run item [1] first."
         return 1
     fi
     detect_schema
@@ -145,11 +178,15 @@ inbounds_json() {
     echo "${out:-[]}"
 }
 
-# Строки: тип<TAB>порт<TAB>значение  (reality→SNI, grpc→serviceName, xhttp→path)
+# Строки: тип<TAB>порт<TAB>значение.
+#   reality — подключение, которое nginx stream находит по SNI (Reality или собственный TLS), значение = SNI;
+#   ws / grpc / xhttp — подключение за nginx http на основном домене, значение = путь.
 inbound_routes() {
     inbounds_json | jq -r '.[]
         | ((.stream_settings | fromjson?) // {}) as $s
         | if   $s.security == "reality" then ["reality", .port, ($s.realitySettings.serverNames[0] // "")]
+          elif $s.security == "tls"     then ["reality", .port, ($s.tlsSettings.serverName // "")]
+          elif $s.network  == "ws"      then ["ws",      .port, ($s.wsSettings.path // "")]
           elif $s.network  == "grpc"    then ["grpc",    .port, ($s.grpcSettings.serviceName // "")]
           elif $s.network  == "xhttp"   then ["xhttp",   .port, ($s.xhttpSettings.path // "")]
           else empty end
@@ -157,12 +194,14 @@ inbound_routes() {
 }
 
 list_inbounds() {
-    printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "ID" "Название" "Порт" "Протокол" "Сеть" "Защита"
-    inbounds_json | jq -r '.[]
+    printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "ID" "$(L "Название" "Name")" "$(L "Порт" "Port")" \
+        "$(L "Протокол" "Protocol")" "$(L "Сеть" "Net")" "$(L "Защита" "Security")"
+    inbounds_json | jq -r --arg via "$(L "TLS через nginx" "TLS via nginx")" '.[]
         | ((.stream_settings | fromjson?) // {}) as $s
         | [.id, .remark, .port, .protocol, ($s.network // "?"),
-           (if $s.security == "reality" then "Reality, SNI " + ($s.realitySettings.serverNames[0] // "?")
-            else "TLS через nginx" end)]
+           (if   $s.security == "reality" then "Reality, SNI " + ($s.realitySettings.serverNames[0] // "?")
+            elif $s.security == "tls"     then "TLS, SNI " + ($s.tlsSettings.serverName // "?")
+            else $via end)]
         | @tsv' \
     | while IFS=$'\t' read -r id remark port proto net sec; do
         printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "$id" "$remark" "$port" "$proto" "$net" "$sec"
@@ -206,13 +245,14 @@ gen_free_port() {
 ask_port() {
     local __var="$1" __p
     while true; do
-        read -rp "$2 (Enter = случайный): " __p
+        read -rp "$2 $(L "(Enter = случайный)" "(Enter = random)"): " __p
         [[ -z "$__p" ]] && __p=$(gen_free_port)
         if [[ ! "$__p" =~ ^[0-9]+$ ]] || (( __p < 1 || __p > 65535 )); then
-            msg_wrn "Порт должен быть числом 1-65535."; continue
+            msg_wrn "Порт должен быть числом 1-65535." "The port must be a number 1-65535."; continue
         fi
         if ! port_is_free "$__p"; then
-            msg_wrn "Порт $__p занят или зарезервирован, выберите другой."; continue
+            msg_wrn "Порт $__p занят или зарезервирован, выберите другой." \
+                    "Port $__p is busy or reserved, choose another one."; continue
         fi
         USED_PORTS+=("$__p")
         printf -v "$__var" '%s' "$__p"
@@ -229,7 +269,7 @@ ask_domain() {
         ask __d "$2" "${3:-}"
         __d="${__d,,}"
         [[ "$__d" =~ $DOMAIN_RE ]] && { printf -v "$__var" '%s' "$__d"; return; }
-        msg_wrn "Некорректное доменное имя."
+        msg_wrn "Некорректное доменное имя." "Invalid domain name."
     done
 }
 
@@ -245,9 +285,11 @@ ask_sni() {
     local __v="$1" __s __def=""
     sni_in_use "$REALITY_DOMAIN" || __def="$REALITY_DOMAIN"
     while true; do
-        ask_domain __s "  SNI-домен этого подключения (свой поддомен, A-запись на этот сервер)" "$__def"
+        ask_domain __s "$(L "  SNI-домен этого подключения (свой поддомен, A-запись на этот сервер)" \
+                             "  SNI domain for this connection (its own subdomain, A record to this server)")" "$__def"
         sni_in_use "$__s" || break
-        msg_wrn "Домен $__s уже занят (основным доменом или другим подключением)."
+        msg_wrn "Домен $__s уже занят (основным доменом или другим подключением)." \
+                "Domain $__s is already in use (by the main domain or another connection)."
     done
     USED_SNI+=("$__s")
     printf -v "$__v" '%s' "$__s"
@@ -313,8 +355,25 @@ resolve_country() {
 }
 
 # make_remark "ввод страны" → "🇫🇮 Финляндия" (только флаг и страна, без суффиксов)
+# Английское название страны по ISO-коду (для интерфейса на английском)
+country_en() {
+    case "$1" in
+        FI) echo "Finland" ;;      DE) echo "Germany" ;;       NL) echo "Netherlands" ;;  FR) echo "France" ;;
+        GB) echo "United Kingdom" ;; US) echo "USA" ;;         CA) echo "Canada" ;;       SE) echo "Sweden" ;;
+        NO) echo "Norway" ;;       DK) echo "Denmark" ;;       EE) echo "Estonia" ;;      LV) echo "Latvia" ;;
+        LT) echo "Lithuania" ;;    PL) echo "Poland" ;;        CZ) echo "Czechia" ;;      AT) echo "Austria" ;;
+        CH) echo "Switzerland" ;;  IT) echo "Italy" ;;         ES) echo "Spain" ;;        PT) echo "Portugal" ;;
+        IE) echo "Ireland" ;;      BE) echo "Belgium" ;;       RO) echo "Romania" ;;      BG) echo "Bulgaria" ;;
+        MD) echo "Moldova" ;;      RS) echo "Serbia" ;;        TR) echo "Turkey" ;;       AE) echo "UAE" ;;
+        KZ) echo "Kazakhstan" ;;   AM) echo "Armenia" ;;       GE) echo "Georgia" ;;      RU) echo "Russia" ;;
+        JP) echo "Japan" ;;        KR) echo "South Korea" ;;   SG) echo "Singapore" ;;    HK) echo "Hong Kong" ;;
+        IN) echo "India" ;;        AU) echo "Australia" ;;     IL) echo "Israel" ;;       *)  echo "$1" ;;
+    esac
+}
+
 make_remark() {
     resolve_country "$1"
+    [[ $XLANG == en && -n "$COUNTRY_CODE" ]] && COUNTRY_NAME=$(country_en "$COUNTRY_CODE")
     if [[ -n "$COUNTRY_CODE" ]]; then
         printf '%s %s' "$(flag_from_iso "$COUNTRY_CODE")" "$COUNTRY_NAME"
     else
@@ -325,42 +384,67 @@ make_remark() {
 ###############################################################################
 # КОНСТРУКТОР ПОДКЛЮЧЕНИЙ
 ###############################################################################
-# Два класса подключений:
-#   reality — nginx stream отдаёт TLS как есть в Xray по SNI (нужен свой домен);
-#   nginx   — TLS снимает nginx на основном домене и проксирует по пути (gRPC/XHTTP).
+# Три класса подключений (V_SEC):
+#   reality — nginx stream отдаёт TLS как есть в Xray по SNI, Xray маскируется под свой же сайт;
+#   tls     — то же, но Xray сам снимает TLS сертификатом своего домена (классический TCP+TLS);
+#   nginx   — TLS снимает nginx на основном домене и проксирует по пути (WebSocket/gRPC/XHTTP).
+# Классам reality и tls нужен отдельный домен на каждое подключение, классу nginx — нет.
 # Shadowsocks не умеет Reality в панели, а "голый" TCP нельзя развести по SNI на 443,
 # поэтому для него доступны только варианты через nginx.
 
-# choose_variant → V_PROTO (vless|trojan|shadowsocks), V_NET (tcp|grpc|xhttp), V_SEC (reality|nginx)
+# needs_sni SEC — нужен ли подключению собственный домен (маршрутизация по SNI)
+needs_sni() { [[ "$1" == reality || "$1" == tls ]]; }
+
+# choose_variant → V_PROTO (vless|trojan|shadowsocks), V_NET (tcp|ws|grpc|xhttp), V_SEC (reality|tls|nginx)
 choose_variant() {
-    local p t
-    echo "  Протокол:"
+    local p t via own
+    via=$(L "через nginx, основной домен" "via nginx, main domain")
+    own=$(L "свой домен и сертификат" "own domain and certificate")
+
+    say "  Протокол:" "  Protocol:"
     echo "    1) VLESS"
     echo "    2) Trojan"
     echo "    3) Shadowsocks (2022-blake3-aes-256-gcm)"
-    while true; do ask p "  Выбор" "1"; [[ "$p" =~ ^[123]$ ]] && break; msg_wrn "Введите 1, 2 или 3."; done
+    while true; do
+        askl p "  Выбор" "  Choice" "1"
+        [[ "$p" =~ ^[123]$ ]] && break
+        msg_wrn "Введите 1, 2 или 3." "Enter 1, 2 or 3."
+    done
     case "$p" in 1) V_PROTO=vless ;; 2) V_PROTO=trojan ;; 3) V_PROTO=shadowsocks ;; esac
 
-    echo "  Транспорт и защита:"
+    say "  Транспорт и защита:" "  Transport and security:"
     if [[ $V_PROTO == shadowsocks ]]; then
-        echo "    1) gRPC  + TLS (через nginx, основной домен)"
-        echo "    2) XHTTP + TLS (через nginx, основной домен)"
-        while true; do ask t "  Выбор" "1"; [[ "$t" =~ ^[12]$ ]] && break; msg_wrn "Введите 1 или 2."; done
+        echo "    1) WebSocket + TLS (${via})"
+        echo "    2) gRPC      + TLS (${via})"
+        echo "    3) XHTTP     + TLS (${via})"
+        while true; do
+            askl t "  Выбор" "  Choice" "1"
+            [[ "$t" =~ ^[123]$ ]] && break
+            msg_wrn "Введите 1, 2 или 3." "Enter 1, 2 or 3."
+        done
         V_SEC=nginx
-        case "$t" in 1) V_NET=grpc ;; 2) V_NET=xhttp ;; esac
+        case "$t" in 1) V_NET=ws ;; 2) V_NET=grpc ;; 3) V_NET=xhttp ;; esac
     else
-        echo "    1) TCP   + Reality"
-        echo "    2) gRPC  + Reality"
-        echo "    3) XHTTP + Reality"
-        echo "    4) gRPC  + TLS (через nginx, основной домен)"
-        echo "    5) XHTTP + TLS (через nginx, основной домен)"
-        while true; do ask t "  Выбор" "1"; [[ "$t" =~ ^[1-5]$ ]] && break; msg_wrn "Введите число 1-5."; done
+        echo "    1) TCP       + Reality"
+        echo "    2) gRPC      + Reality"
+        echo "    3) XHTTP     + Reality"
+        echo "    4) TCP       + TLS (${own})"
+        echo "    5) WebSocket + TLS (${via})"
+        echo "    6) gRPC      + TLS (${via})"
+        echo "    7) XHTTP     + TLS (${via})"
+        while true; do
+            askl t "  Выбор" "  Choice" "1"
+            [[ "$t" =~ ^[1-7]$ ]] && break
+            msg_wrn "Введите число 1-7." "Enter a number 1-7."
+        done
         case "$t" in
             1) V_NET=tcp;   V_SEC=reality ;;
             2) V_NET=grpc;  V_SEC=reality ;;
             3) V_NET=xhttp; V_SEC=reality ;;
-            4) V_NET=grpc;  V_SEC=nginx ;;
-            5) V_NET=xhttp; V_SEC=nginx ;;
+            4) V_NET=tcp;   V_SEC=tls ;;
+            5) V_NET=ws;    V_SEC=nginx ;;
+            6) V_NET=grpc;  V_SEC=nginx ;;
+            7) V_NET=xhttp; V_SEC=nginx ;;
         esac
     fi
 }
@@ -377,17 +461,17 @@ build_settings() {
 
 find_xray() {
     XRAY_BIN=$(ls "$XUI_DIR"/bin/xray-linux-* 2>/dev/null | head -1)
-    [[ -x "$XRAY_BIN" ]] || die "Не найден бинарник xray в $XUI_DIR/bin"
+    [[ -x "$XRAY_BIN" ]] || die "Не найден бинарник xray в $XUI_DIR/bin" "xray binary not found in $XUI_DIR/bin"
 }
 
 # gen_reality SNI → JSON realitySettings с новыми ключами x25519 и shortIds
 gen_reality() {
     local keys priv pub sids
     # Формат вывода `xray x25519` менялся ("Private key:/Public key:" → "PrivateKey:/Password:")
-    keys=$("$XRAY_BIN" x25519) || die "xray x25519 завершился с ошибкой"
+    keys=$("$XRAY_BIN" x25519) || die "xray x25519 завершился с ошибкой" "xray x25519 failed"
     priv=$(awk '/^Private ?[Kk]ey/{print $NF; exit}'           <<<"$keys")
     pub=$(awk  '/^(Password|Public ?[Kk]ey)/{print $NF; exit}' <<<"$keys")
-    [[ -n "$priv" && -n "$pub" ]] || die "Не удалось разобрать ключи x25519: $keys"
+    [[ -n "$priv" && -n "$pub" ]] || die "Не удалось разобрать ключи x25519: $keys" "Failed to parse x25519 keys: $keys"
     sids=$(jq -cn '$ARGS.positional' --args \
         "$(openssl rand -hex 8)" "$(openssl rand -hex 8)" "$(openssl rand -hex 4)" "$(openssl rand -hex 2)")
 
@@ -401,7 +485,7 @@ gen_reality() {
 
 # build_stream NET SEC SNI [старый realitySettings] → STREAM_JSON
 build_stream() {
-    local net="$1" sec="$2" sni="$3" r="${4:-}" pp=false secname=none path
+    local net="$1" sec="$2" sni="$3" r="${4:-}" pp=false secname=none tls=null path
     path=$(gen_random_string 12)
     if [[ $sec == reality ]]; then
         if [[ -n "$r" ]]; then
@@ -411,19 +495,31 @@ build_stream() {
             r=$(gen_reality "$sni")
         fi
         pp=true; secname=reality      # nginx stream шлёт PROXY protocol → inbound обязан его принимать
+    elif [[ $sec == tls ]]; then
+        # Xray сам снимает TLS сертификатом Let's Encrypt своего домена (файлы он перечитывает сам)
+        r=null; pp=true; secname=tls
+        tls=$(jq -cn --arg sni "$sni" --arg fp "$FINGERPRINT" '{
+            serverName:$sni, minVersion:"1.2", maxVersion:"1.3", cipherSuites:"",
+            rejectUnknownSni:false, disableSystemRoot:false, enableSessionResumption:false,
+            certificates:[{certificateFile:("/etc/letsencrypt/live/"+$sni+"/fullchain.pem"),
+                           keyFile:("/etc/letsencrypt/live/"+$sni+"/privkey.pem"),
+                           ocspStapling:3600, oneTimeLoading:false, usage:"encipherment", buildChain:false}],
+            alpn:["h2","http/1.1"],
+            settings:{allowInsecure:false, fingerprint:$fp, echConfigList:""}}')
     else
         r=null                        # трафик приходит от nginx http, PROXY protocol не используется
     fi
 
-    STREAM_JSON=$(jq -cn --arg net "$net" --arg sec "$secname" --argjson r "$r" --argjson pp "$pp" \
-        --arg path "$path" --arg host "$MAIN_DOMAIN" '
+    STREAM_JSON=$(jq -cn --arg net "$net" --arg sec "$secname" --argjson r "$r" --argjson tls "$tls" \
+        --argjson pp "$pp" --arg path "$path" --arg host "$MAIN_DOMAIN" '
         {network:$net, security:$sec}
-        + (if $sec == "reality" then {realitySettings:$r} else {} end)
+        + (if $sec == "reality" then {realitySettings:$r} elif $sec == "tls" then {tlsSettings:$tls} else {} end)
         + (if   $net == "tcp"  then {tcpSettings:{acceptProxyProtocol:$pp, header:{type:"none"}}}
+           elif $net == "ws"   then {wsSettings:{acceptProxyProtocol:false, path:("/"+$path), host:$host, headers:{}}}
            elif $net == "grpc" then {grpcSettings:{serviceName:$path, authority:(if $sec=="reality" then "" else $host end), multiMode:false}}
            else {xhttpSettings:{path:("/"+$path), host:(if $sec=="reality" then "" else $host end), mode:"auto"}} end)
         + (if $pp and $net != "tcp" then {sockopt:{acceptProxyProtocol:true}} else {} end)')
-    jq -e . <<<"$STREAM_JSON" >/dev/null || die "Сформирован некорректный JSON stream_settings"
+    jq -e . <<<"$STREAM_JSON" >/dev/null || die "Сформирован некорректный JSON stream_settings" "Generated stream_settings JSON is invalid"
 }
 
 # Структура БД зависит от версии панели — проверяем фактическую схему
@@ -439,7 +535,7 @@ detect_schema() {
 add_external_proxy() {    # SEC SNI
     [[ $HAS_HOSTS == y ]] && return 0
     local dest="$MAIN_DOMAIN" force="tls"
-    [[ "$1" == reality ]] && { dest="$2"; force="same"; }
+    needs_sni "$1" && { dest="$2"; force="same"; }
     STREAM_JSON=$(jq -c --arg d "$dest" --arg f "$force" \
         '. + {externalProxy:[{forceTls:$f, dest:$d, port:443, remark:""}]}' <<<"$STREAM_JSON")
 }
@@ -448,12 +544,14 @@ add_external_proxy() {    # SEC SNI
 set_host() {              # INBOUND_ID SEC SNI
     [[ $HAS_HOSTS == y ]] || return 0
     local id="$1" addr="$MAIN_DOMAIN" sec="tls" fp="$FINGERPRINT" alpn='["h2"]' gid_col="" gid_val=""
-    [[ "$2" == reality ]] && { addr="$3"; sec="same"; fp=""; alpn='[]'; }
+    needs_sni "$2" && { addr="$3"; sec="same"; fp=""; alpn='[]'; }
+    [[ "$2" == nginx ]] && alpn='["h2","http/1.1"]'    # WebSocket идёт по HTTP/1.1, gRPC и XHTTP — по h2
     [[ $HAS_GROUP_ID == y ]] && { gid_col='group_id,'; gid_val="'$(gen_group_id)',"; }
     sqlite3 "$XUIDB" "DELETE FROM hosts WHERE inbound_id=${id};
         INSERT INTO hosts (inbound_id, ${gid_col} sort_order, remark, address, port, security, fingerprint, alpn)
         VALUES (${id}, ${gid_val} 0, '', '${addr}', 443, '${sec}', '${fp}', '${alpn}');" \
-        || msg_wrn "Не удалось записать host для inbound #${id} — задайте внешний адрес ${addr}:443 в панели вручную."
+        || msg_wrn "Не удалось записать host для inbound #${id} — задайте внешний адрес ${addr}:443 в панели вручную." \
+                   "Failed to write the host for inbound #${id} — set the external address ${addr}:443 in the panel manually."
 }
 
 # db_add_inbound REMARK PORT PROTO NET SEC SNI
@@ -472,11 +570,12 @@ db_add_inbound() {
          settings, stream_settings, tag, sniffing)
         VALUES (1, 0, 0, 0, '$(sq "$remark")', 1, 0, '127.0.0.1', ${port}, '${proto}',
          '$(sq "$settings")', '$(sq "$STREAM_JSON")', '${tag}', '${sniffing}');" \
-        || die "Ошибка добавления подключения на порт ${port}"
+        || die "Ошибка добавления подключения на порт ${port}" "Failed to add the connection on port ${port}"
 
     id=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE tag='${tag}';")
     set_host "$id" "$sec" "$sni"
-    msg_ok "Подключение: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})"
+    msg_ok "Подключение: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})" \
+           "Connection: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})"
 }
 
 # ─── Интерактивный сбор параметров одного подключения ────────────────────────
@@ -484,25 +583,28 @@ P_REMARK=(); P_PORT=(); P_PROTO=(); P_NET=(); P_SEC=(); P_SNI=()
 
 collect_one_inbound() {
     local country remark port sni=""
-    ask country "  Страна (название или ISO-код: Финляндия, Germany, NL ...)"
+    askl country "  Страна (название или ISO-код: Финляндия, Germany, NL ...)" \
+                 "  Country (name or ISO code: Finland, Germany, NL ...)"
     [[ -z "$country" ]] && country="XX"
     remark=$(make_remark "$country")
 
-    ask_port port "  Локальный порт подключения, напр. 440, 444, 445"
+    ask_port port "$(L "  Локальный порт подключения, напр. 440, 444, 445" "  Local port of the connection, e.g. 440, 444, 445")"
     choose_variant
-    if [[ $V_SEC == reality ]]; then
-        echo "  Reality: nginx различает подключения на 443 только по SNI — нужен отдельный (под)домен."
+    if needs_sni "$V_SEC"; then
+        say "  Nginx различает такие подключения на 443 только по SNI — нужен отдельный (под)домен." \
+            "  Nginx tells such connections apart on 443 only by SNI — a separate (sub)domain is required."
         ask_sni sni
     fi
 
     P_REMARK+=("$remark"); P_PORT+=("$port"); P_PROTO+=("$V_PROTO")
     P_NET+=("$V_NET"); P_SEC+=("$V_SEC"); P_SNI+=("$sni")
-    msg_ok "Принято: ${remark} | 127.0.0.1:${port} | ${V_PROTO} ${V_NET} ${V_SEC}${sni:+ | SNI ${sni}}"
+    msg_ok "Принято: ${remark} | 127.0.0.1:${port} | ${V_PROTO} ${V_NET} ${V_SEC}${sni:+ | SNI ${sni}}" \
+           "Accepted: ${remark} | 127.0.0.1:${port} | ${V_PROTO} ${V_NET} ${V_SEC}${sni:+ | SNI ${sni}}"
 }
 
 collect_inbounds_loop() {
     P_REMARK=(); P_PORT=(); P_PROTO=(); P_NET=(); P_SEC=(); P_SNI=()
-    while confirm "Хотите добавить ноду/подключение?" y; do
+    while confirml "Хотите добавить ноду/подключение?" "Add a node/connection?" y; do
         collect_one_inbound
     done
 }
@@ -514,7 +616,7 @@ collect_inbounds_loop() {
 # поэтому nginx останавливается (его запускает apply_nginx / вызывающий код).
 issue_cert() {
     local d="$1"
-    [[ -f "/etc/letsencrypt/live/${d}/fullchain.pem" ]] && { msg_ok "Сертификат для $d уже есть."; return 0; }
+    [[ -f "/etc/letsencrypt/live/${d}/fullchain.pem" ]] && { msg_ok "Сертификат для $d уже есть." "A certificate for $d already exists."; return 0; }
     systemctl stop nginx 2>/dev/null || true
     fuser -k 80/tcp 2>/dev/null || true
     certbot certonly --standalone --non-interactive --agree-tos \
@@ -577,6 +679,25 @@ h2_location() {           # PATH PORT
 EOF
 }
 
+# Блок location для WebSocket-подключения за nginx (HTTP/1.1 Upgrade к Xray на loopback)
+ws_location() {           # PATH PORT
+    cat <<EOF
+
+    location /$1 {
+        proxy_pass http://127.0.0.1:$2;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade         \$http_upgrade;
+        proxy_set_header Connection      "upgrade";
+        proxy_set_header Host            \$host;
+        proxy_set_header X-Real-IP       \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_buffering    off;
+    }
+EOF
+}
+
 # write_vhost DOMAIN DEFAULT_SUFFIX EXTRA_LOCATIONS — дописывает server{} в $NGX_CONF
 write_vhost() {
     cat >> "$NGX_CONF" <<EOF
@@ -608,7 +729,7 @@ EOF
 
 # Полная пересборка конфигурации nginx из state.env + x-ui.db
 apply_nginx() {
-    msg_inf "Сборка конфигурации Nginx..."
+    msg_inf "Сборка конфигурации Nginx..." "Building Nginx configuration..."
     mkdir -p /etc/nginx/stream-enabled
 
     # nginx >= 1.25.1: "http2 on;", старше (Debian 12) — "listen ... http2"
@@ -628,11 +749,11 @@ apply_nginx() {
         case "$kind" in
             reality)
                 if [[ ! "$val" =~ $DOMAIN_RE ]]; then
-                    msg_wrn "Порт ${port}: некорректный SNI '${val}' — пропущено."; continue; fi
+                    msg_wrn "Порт ${port}: некорректный SNI '${val}' — пропущено." "Port ${port}: invalid SNI '${val}' — skipped."; continue; fi
                 if [[ "$val" == "$MAIN_DOMAIN" || "$seen_sni" == *" $val "* ]]; then
-                    msg_wrn "Порт ${port}: SNI ${val} уже занят — подключение не будет доступно снаружи."; continue; fi
+                    msg_wrn "Порт ${port}: SNI ${val} уже занят — подключение не будет доступно снаружи." "Port ${port}: SNI ${val} is already in use — the connection will not be reachable from outside."; continue; fi
                 if [[ ! -f "/etc/letsencrypt/live/${val}/fullchain.pem" ]]; then
-                    msg_wrn "Порт ${port}: нет сертификата для ${val} — пропущено."; continue; fi
+                    msg_wrn "Порт ${port}: нет сертификата для ${val} — пропущено." "Port ${port}: no certificate for ${val} — skipped."; continue; fi
                 seen_sni+="$val "
                 map_lines+="    ${val}    inb_${port};"$'\n'
                 upstreams+="upstream inb_${port} { server 127.0.0.1:${port}; }"$'\n'
@@ -641,8 +762,14 @@ apply_nginx() {
             grpc|xhttp)
                 val="${val#/}"
                 if [[ ! "$val" =~ ^[A-Za-z0-9/_-]+$ ]]; then
-                    msg_wrn "Порт ${port}: путь '${val}' не подходит для nginx — пропущено."; continue; fi
+                    msg_wrn "Порт ${port}: путь '${val}' не подходит для nginx — пропущено." "Port ${port}: path '${val}' is not suitable for nginx — skipped."; continue; fi
                 h2_locations+=$(h2_location "$val" "$port")$'\n'
+                ;;
+            ws)
+                val="${val#/}"
+                if [[ ! "$val" =~ ^[A-Za-z0-9/_-]+$ ]]; then
+                    msg_wrn "Порт ${port}: путь '${val}' не подходит для nginx — пропущено." "Port ${port}: path '${val}' is not suitable for nginx — skipped."; continue; fi
+                h2_locations+=$(ws_location "$val" "$port")$'\n'
                 ;;
         esac
     done < <(inbound_routes)
@@ -751,10 +878,10 @@ EOF
 
     ln -sf "$NGX_CONF" /etc/nginx/sites-enabled/xpro.conf
 
-    nginx -t || die "Проверка конфигурации nginx не пройдена (см. вывод выше)."
+    nginx -t || die "Проверка конфигурации nginx не пройдена (см. вывод выше)." "nginx configuration check failed (see the output above)."
     systemctl enable nginx >/dev/null 2>&1
-    systemctl restart nginx || die "nginx не запустился: journalctl -u nginx -n 50"
-    msg_ok "Nginx перезапущен."
+    systemctl restart nginx || die "nginx не запустился: journalctl -u nginx -n 50" "nginx did not start: journalctl -u nginx -n 50"
+    msg_ok "Nginx перезапущен." "Nginx restarted."
 }
 
 # ─── Сайт-заглушка ───────────────────────────────────────────────────────────
@@ -777,16 +904,18 @@ install_fake_site() {
     mkdir -p /var/www/html
     rm -rf /var/www/html/*
 
-    msg_inf "Сайт-заглушка: $(basename "$(dirname "$(dirname "$(dirname "$(dirname "$url")")")")")"
+    local site_name
+    site_name=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$url")")")")")
+    msg_inf "Сайт-заглушка: ${site_name}" "Decoy site: ${site_name}"
     if wget -q --show-progress -T 30 -O "$tmp/site.tar.gz" "$url" && tar -xzf "$tmp/site.tar.gz" -C "$tmp"; then
         src=$(find "$tmp" -maxdepth 2 -type d -name dist | head -1)
         if [[ -n "$src" && -f "$src/index.html" ]]; then
             cp -a "$src"/. /var/www/html/
-            msg_ok "Шаблон сайта установлен."
+            msg_ok "Шаблон сайта установлен." "Site template installed."
         fi
     fi
     if [[ ! -f /var/www/html/index.html ]]; then
-        msg_wrn "Не удалось скачать шаблон — ставлю простую страницу."
+        msg_wrn "Не удалось скачать шаблон — ставлю простую страницу." "Failed to download the template — installing a simple page."
         write_fallback_site
     fi
     rm -rf "$tmp"
@@ -817,13 +946,13 @@ whitelist_list() {
 
 whitelist_add() {
     if [[ ! "$1" =~ $IP_RE ]]; then
-        msg_wrn "Некорректный IPv4-адрес или подсеть: $1"; return 1
+        msg_wrn "Некорректный IPv4-адрес или подсеть: $1" "Invalid IPv4 address or subnet: $1"; return 1
     fi
     mkdir -p "$STATE_DIR"
     echo "$1" >> "$WHITELIST_FILE"
     sort -u -o "$WHITELIST_FILE" "$WHITELIST_FILE"
     chmod 600 "$WHITELIST_FILE"
-    msg_ok "В whitelist добавлен: $1"
+    msg_ok "В whitelist добавлен: $1" "Added to the whitelist: $1"
 }
 
 # Интерактивный ввод whitelist: текущий IP администратора + адреса зарубежных серверов
@@ -831,10 +960,10 @@ whitelist_ask() {
     local cip ip
     cip=$(admin_ip)
     if [[ "$cip" =~ $IP_RE ]]; then
-        confirm "Добавить в whitelist ваш текущий IP (${cip}), чтобы не потерять доступ к панели?" y \
+        confirml "Добавить в whitelist ваш текущий IP (${cip}), чтобы не потерять доступ к панели?" "Add your current IP (${cip}) to the whitelist so you do not lose access to the panel?" y \
             && whitelist_add "$cip"
     fi
-    echo "IP-адреса или подсети зарубежных серверов для whitelist (по одному, Enter — закончить):"
+    say "IP-адреса или подсети зарубежных серверов для whitelist (по одному, Enter — закончить):" "IP addresses or subnets of foreign servers for the whitelist (one per line, Enter — finish):"
     while true; do
         ask ip "  IP"
         [[ -z "$ip" ]] && break
@@ -853,7 +982,7 @@ geoip_download_db() {
             mkdir -p "$(dirname "$GEOIP_DB")"
             install -m 644 "$tmp/db.mmdb" "$GEOIP_DB"
             rm -rf "$tmp"
-            msg_ok "База GeoIP обновлена (DB-IP Country Lite ${ym})."
+            msg_ok "База GeoIP обновлена (DB-IP Country Lite ${ym})." "GeoIP database updated (DB-IP Country Lite ${ym})."
             return 0
         fi
     done
@@ -893,20 +1022,20 @@ geoip_write_conf() {
 
 # Подготовка GeoIP: модуль, база, переменные, автообновление. nginx применяет apply_nginx.
 geoip_enable() {
-    msg_inf "Настройка GeoIP-защиты админ-панелей..."
+    msg_inf "Настройка GeoIP-защиты админ-панелей..." "Setting up GeoIP protection for the admin panels..."
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get install -y libnginx-mod-http-geoip2 >/dev/null 2>&1; then
-        msg_wrn "Не удалось установить libnginx-mod-http-geoip2 — GeoIP не включён."; return 1
+        msg_wrn "Не удалось установить libnginx-mod-http-geoip2 — GeoIP не включён." "Failed to install libnginx-mod-http-geoip2 — GeoIP is not enabled."; return 1
     fi
     if [[ ! -s "$GEOIP_DB" ]] && ! geoip_download_db; then
-        msg_wrn "Не удалось скачать базу DB-IP — GeoIP не включён."; return 1
+        msg_wrn "Не удалось скачать базу DB-IP — GeoIP не включён." "Failed to download the DB-IP database — GeoIP is not enabled."; return 1
     fi
 
     geoip_write_conf
     if ! nginx -t >/dev/null 2>&1; then
         nginx -t
         rm -f "$GEOIP_CONF"
-        msg_wrn "Nginx не принял конфигурацию GeoIP — защита не включена."; return 1
+        msg_wrn "Nginx не принял конфигурацию GeoIP — защита не включена." "Nginx rejected the GeoIP configuration — protection is not enabled."; return 1
     fi
 
     # Ежемесячное обновление базы (nginx перечитывает её сам: auto_reload)
@@ -929,7 +1058,7 @@ EOF
     chmod 644 "$GEOIP_CRON"
 
     GEOIP_ENABLED="y"
-    msg_ok "GeoIP готов: панель и дашборд доступны только из ${GEOIP_ALLOW_COUNTRY} и с адресов whitelist."
+    msg_ok "GeoIP готов: панель и дашборд доступны только из ${GEOIP_ALLOW_COUNTRY} и с адресов whitelist." "GeoIP is ready: the panel and dashboard are reachable only from ${GEOIP_ALLOW_COUNTRY} and whitelisted addresses."
 }
 
 geoip_disable() {
@@ -938,7 +1067,7 @@ geoip_disable() {
     apply_nginx                       # убирает проверку из location панели и дашборда
     rm -f "$GEOIP_CONF" "$GEOIP_UPDATER" "$GEOIP_CRON"
     nginx -t >/dev/null 2>&1 && systemctl reload nginx
-    msg_ok "GeoIP-защита отключена. Whitelist сохранён."
+    msg_ok "GeoIP-защита отключена. Whitelist сохранён." "GeoIP protection disabled. The whitelist is kept."
 }
 
 # Применить изменения whitelist к работающему nginx
@@ -946,25 +1075,26 @@ geoip_reload() {
     [[ $GEOIP_ENABLED == y ]] || return 0
     geoip_write_conf
     if nginx -t >/dev/null 2>&1; then
-        systemctl reload nginx && msg_ok "Whitelist применён."
+        systemctl reload nginx && msg_ok "Whitelist применён." "Whitelist applied."
     else
         nginx -t
-        msg_wrn "Nginx не принял новый whitelist — проверьте ${WHITELIST_FILE}."
+        msg_wrn "Nginx не принял новый whitelist — проверьте ${WHITELIST_FILE}." "Nginx rejected the new whitelist — check ${WHITELIST_FILE}."
     fi
 }
 
 geoip_status() {
     if [[ $GEOIP_ENABLED == y ]]; then
-        echo -e "  GeoIP-защита: \e[1;32mвключена\e[0m (разрешена страна ${GEOIP_ALLOW_COUNTRY} + whitelist)"
-        [[ -f "$GEOIP_DB" ]] && echo "  База: ${GEOIP_DB} от $(date -r "$GEOIP_DB" '+%d.%m.%Y')"
+        say "  GeoIP-защита: \e[1;32mвключена\e[0m (разрешена страна ${GEOIP_ALLOW_COUNTRY} + whitelist)" "  GeoIP protection: \e[1;32menabled\e[0m (allowed country ${GEOIP_ALLOW_COUNTRY} + whitelist)"
+        [[ -f "$GEOIP_DB" ]] && say "  База: ${GEOIP_DB} от $(date -r "$GEOIP_DB" '+%d.%m.%Y')" \
+                                    "  Database: ${GEOIP_DB}, dated $(date -r "$GEOIP_DB" '+%d.%m.%Y')"
     else
-        echo -e "  GeoIP-защита: \e[1;33mвыключена\e[0m"
+        say "  GeoIP-защита: \e[1;33mвыключена\e[0m" "  GeoIP protection: \e[1;33mdisabled\e[0m"
     fi
-    echo "  Всегда разрешены: 127.0.0.1 и адреса сервера ($(server_ips | paste -sd' '))"
+    say "  Всегда разрешены: 127.0.0.1 и адреса сервера ($(server_ips | paste -sd' '))" "  Always allowed: 127.0.0.1 and the server addresses ($(server_ips | paste -sd' '))"
     echo "  Whitelist:"
     local list
     list=$(whitelist_list)
-    if [[ -n "$list" ]]; then sed 's/^/    /' <<<"$list"; else echo "    (пусто)"; fi
+    if [[ -n "$list" ]]; then sed 's/^/    /' <<<"$list"; else say "    (пусто)" "    (empty)"; fi
 }
 
 action_geoip() {
@@ -973,41 +1103,41 @@ action_geoip() {
     local c ip
     while true; do
         echo
-        echo -e "\e[1;36m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m"
+        say "\e[1;36m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;36m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
         geoip_status
         echo
-        echo "  [1] Включить GeoIP-защиту"
-        echo "  [2] Отключить GeoIP-защиту"
-        echo "  [3] Добавить IP в whitelist"
-        echo "  [4] Удалить IP из whitelist"
-        echo "  [5] Обновить базу GeoIP"
-        echo "  [0] Назад"
-        read -rp "  Выберите пункт: " c
+        say "  [1] Включить GeoIP-защиту" "  [1] Enable GeoIP protection"
+        say "  [2] Отключить GeoIP-защиту" "  [2] Disable GeoIP protection"
+        say "  [3] Добавить IP в whitelist" "  [3] Add an IP to the whitelist"
+        say "  [4] Удалить IP из whitelist" "  [4] Remove an IP from the whitelist"
+        say "  [5] Обновить базу GeoIP" "  [5] Update the GeoIP database"
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
         if [[ $INSTALLED == n && "$c" =~ ^[125]$ ]]; then
-            msg_wrn "GeoIP защищает панель и дашборд — сначала установите 3x-ui (пункт [1] главного меню)."
-            msg_inf "Whitelist можно заполнить уже сейчас (пункты [3] и [4]): он применится при включении."
+            msg_wrn "GeoIP защищает панель и дашборд — сначала установите 3x-ui (пункт [1] главного меню)." "GeoIP protects the panel and dashboard — install 3x-ui first (item [1] of the main menu)."
+            msg_inf "Whitelist можно заполнить уже сейчас (пункты [3] и [4]): он применится при включении." "The whitelist can be filled right now (items [3] and [4]): it is applied when GeoIP is enabled."
             continue
         fi
         case "$c" in
-            1)  msg_wrn "Если вы сами не в ${GEOIP_ALLOW_COUNTRY} и вашего IP нет в whitelist — панель перестанет открываться."
-                msg_wrn "Вернуть доступ можно будет по SSH: это меню, пункт [2]."
+            1)  msg_wrn "Если вы сами не в ${GEOIP_ALLOW_COUNTRY} и вашего IP нет в whitelist — панель перестанет открываться." "If you are not in ${GEOIP_ALLOW_COUNTRY} yourself and your IP is not whitelisted, the panel will stop opening."
+                msg_wrn "Вернуть доступ можно будет по SSH: это меню, пункт [2]." "Access can be restored over SSH: this menu, item [2]."
                 whitelist_ask
                 if geoip_enable; then save_state; apply_nginx; fi ;;
             2)  geoip_disable ;;
-            3)  ask ip "IP или подсеть"
+            3)  askl ip "IP или подсеть" "IP or subnet"
                 [[ -n "$ip" ]] && whitelist_add "$ip" && geoip_reload ;;
-            4)  ask ip "IP или подсеть для удаления"
+            4)  askl ip "IP или подсеть для удаления" "IP or subnet to remove"
                 if [[ -n "$ip" && -f "$WHITELIST_FILE" ]] && grep -qxF "$ip" "$WHITELIST_FILE"; then
                     grep -vxF "$ip" "$WHITELIST_FILE" > "${WHITELIST_FILE}.tmp"
                     mv -f "${WHITELIST_FILE}.tmp" "$WHITELIST_FILE"
-                    msg_ok "Удалён: $ip"
+                    msg_ok "Удалён: $ip" "Removed: $ip"
                     geoip_reload
                 else
-                    msg_wrn "Такого адреса в whitelist нет."
+                    msg_wrn "Такого адреса в whitelist нет." "No such address in the whitelist."
                 fi ;;
-            5)  geoip_download_db || msg_wrn "Не удалось скачать базу." ;;
+            5)  geoip_download_db || msg_wrn "Не удалось скачать базу." "Failed to download the database." ;;
             0)  return ;;
-            *)  msg_wrn "Нет такого пункта." ;;
+            *)  msg_wrn "Нет такого пункта." "No such item." ;;
         esac
     done
 }
@@ -1018,11 +1148,11 @@ action_geoip() {
 # Принципы: логи Xray/3x-ui не подключаются; баны точечные (multiport);
 # порт 443 (VPN) не банится никогда; вместо recidive — bantime.increment.
 f2b_install() {
-    msg_inf "Установка и настройка Fail2ban..."
+    msg_inf "Установка и настройка Fail2ban..." "Installing and configuring Fail2ban..."
     export DEBIAN_FRONTEND=noninteractive
     # python3-systemd нужен для чтения журнала systemd (Debian 12+ без auth.log)
     if ! apt-get install -y fail2ban python3-systemd >/dev/null 2>&1; then
-        msg_wrn "Не удалось установить fail2ban."; return 1
+        msg_wrn "Не удалось установить fail2ban." "Failed to install fail2ban."; return 1
     fi
 
     local ssh_ports banaction ssh_backend ssh_logpath="" ignoreip cip
@@ -1137,36 +1267,36 @@ EOF
     # Страховка: ни в одном джейле не должно быть порта 443
     if grep -Eq '^port[[:space:]]*=.*\b443\b' "$F2B_JAIL_LOCAL"; then
         if [[ -f "${F2B_JAIL_LOCAL}.bak" ]]; then mv -f "${F2B_JAIL_LOCAL}.bak" "$F2B_JAIL_LOCAL"; else rm -f "$F2B_JAIL_LOCAL"; fi
-        msg_wrn "В джейлах оказался порт 443 (VPN) — конфигурация Fail2ban отменена."; return 1
+        msg_wrn "В джейлах оказался порт 443 (VPN) — конфигурация Fail2ban отменена." "Port 443 (VPN) ended up in the jails — Fail2ban configuration cancelled."; return 1
     fi
 
     if ! fail2ban-client -t >/dev/null 2>&1; then
         fail2ban-client -t
         if [[ -f "${F2B_JAIL_LOCAL}.bak" ]]; then mv -f "${F2B_JAIL_LOCAL}.bak" "$F2B_JAIL_LOCAL"; else rm -f "$F2B_JAIL_LOCAL"; fi
-        msg_wrn "Конфигурация Fail2ban не прошла проверку — изменения отменены."; return 1
+        msg_wrn "Конфигурация Fail2ban не прошла проверку — изменения отменены." "Fail2ban configuration failed validation — changes reverted."; return 1
     fi
 
     systemctl enable fail2ban >/dev/null 2>&1
     if ! systemctl restart fail2ban; then
-        msg_wrn "Fail2ban не запустился: journalctl -u fail2ban -n 30"; return 1
+        msg_wrn "Fail2ban не запустился: journalctl -u fail2ban -n 30" "Fail2ban did not start: journalctl -u fail2ban -n 30"; return 1
     fi
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
         fail2ban-client ping >/dev/null 2>&1 && {
-            msg_ok "Fail2ban запущен."
-            echo "      SSH:       порт ${ssh_ports}, источник логов: ${ssh_backend}"
+            msg_ok "Fail2ban запущен." "Fail2ban is running."
+            say "      SSH:       порт ${ssh_ports}, источник логов: ${ssh_backend}" "      SSH:       port ${ssh_ports}, log source: ${ssh_backend}"
             if [[ $with_nginx == y ]]; then
-                echo "      Nginx:     джейлы банят только порт 80"
+                say "      Nginx:     джейлы банят только порт 80" "      Nginx:     jails ban port 80 only"
             else
-                echo "      Nginx:     не установлен — джейлы Nginx добавятся после установки 3x-ui"
+                say "      Nginx:     не установлен — джейлы Nginx добавятся после установки 3x-ui" "      Nginx:     not installed — Nginx jails are added after 3x-ui is installed"
             fi
-            echo "      Порт 443:  не банится никогда (VPN)"
+            say "      Порт 443:  не банится никогда (VPN)" "      Port 443:  never banned (VPN)"
             echo "      ignoreip:  ${ignoreip}"
             return 0
         }
         sleep 1
     done
-    msg_wrn "Fail2ban не ответил за 10 секунд: journalctl -u fail2ban -n 30"; return 1
+    msg_wrn "Fail2ban не ответил за 10 секунд: journalctl -u fail2ban -n 30" "Fail2ban did not respond within 10 seconds: journalctl -u fail2ban -n 30"; return 1
 }
 
 ###############################################################################
@@ -1176,21 +1306,21 @@ DASH_USER=""; DASH_PASS=""; DASH_PASS_GENERATED="n"
 
 dash_ask_credentials() {
     while true; do
-        ask DASH_USER "Логин дашборда Fail2ban"
+        askl DASH_USER "Логин дашборда Fail2ban" "Fail2ban dashboard login"
         [[ "$DASH_USER" =~ ^[A-Za-z0-9._-]{1,32}$ ]] && break
-        msg_wrn "Допустимы латинские буквы, цифры и символы . _ - (до 32 символов)."
+        msg_wrn "Допустимы латинские буквы, цифры и символы . _ - (до 32 символов)." "Latin letters, digits and . _ - are allowed (up to 32 characters)."
     done
     DASH_PASS_GENERATED="n"
     local again
     while true; do
-        read -rsp "Пароль дашборда (не короче 10 символов, Enter = сгенерировать): " DASH_PASS; echo
+        read -rsp "$(L "Пароль дашборда (не короче 10 символов, Enter = сгенерировать): " "Dashboard password (at least 10 characters, Enter = generate): ")" DASH_PASS; echo
         if [[ -z "$DASH_PASS" ]]; then
             DASH_PASS=$(gen_random_string 20); DASH_PASS_GENERATED="y"; break
         fi
-        if (( ${#DASH_PASS} < 10 )); then msg_wrn "Пароль слишком короткий."; continue; fi
-        read -rsp "Повторите пароль: " again; echo
+        if (( ${#DASH_PASS} < 10 )); then msg_wrn "Пароль слишком короткий." "The password is too short."; continue; fi
+        read -rsp "$(L "Повторите пароль: " "Repeat the password: ")" again; echo
         [[ "$DASH_PASS" == "$again" ]] && break
-        msg_wrn "Пароли не совпадают."
+        msg_wrn "Пароли не совпадают." "Passwords do not match."
     done
 }
 
@@ -1204,18 +1334,19 @@ dash_write_htpasswd() {
 # Файлы дашборда: пароли, сайт, внутренний сервер nginx, генератор данных, cron.
 # Location на основном домене добавляет apply_nginx (по F2B_PATH).
 dash_install() {
-    msg_inf "Установка дашборда Fail2ban..."
+    msg_inf "Установка дашборда Fail2ban..." "Installing the Fail2ban dashboard..."
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get install -y apache2-utils cron curl >/dev/null 2>&1; then
-        msg_wrn "Не удалось установить apache2-utils/cron."; return 1
+        msg_wrn "Не удалось установить apache2-utils/cron." "Failed to install apache2-utils/cron."; return 1
     fi
     systemctl enable --now cron >/dev/null 2>&1
 
-    dash_write_htpasswd -B || { msg_wrn "htpasswd не смог создать файл паролей."; return 1; }
+    dash_write_htpasswd -B || { msg_wrn "htpasswd не смог создать файл паролей." "htpasswd could not create the password file."; return 1; }
 
     mkdir -p "${DASH_ROOT}/assets" "${DASH_ROOT}/api"
     dash_write_web_files
     dash_write_generator
+    dash_localize
 
     # Внутренний сервер: только loopback, HTTP, без сертификатов
     cat > "$DASH_NGINX_CONF" <<EOF
@@ -1274,10 +1405,10 @@ EOF
     printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root %s >/dev/null 2>&1\n' \
         "$DASH_GEN" > "$DASH_CRON"
     chmod 644 "$DASH_CRON"
-    "$DASH_GEN" || msg_wrn "Первый запуск генератора завершился с ошибкой: проверьте ${DASH_GEN}"
+    "$DASH_GEN" || msg_wrn "Первый запуск генератора завершился с ошибкой: проверьте ${DASH_GEN}" "The first run of the generator failed: check ${DASH_GEN}"
 
     [[ "$F2B_PATH" =~ ^[A-Za-z0-9]{8,}$ ]] || F2B_PATH=$(gen_random_string 12)
-    msg_ok "Дашборд подготовлен (127.0.0.1:${DASH_PORT}, данные: ${DASH_ROOT}/api/data.html)."
+    msg_ok "Дашборд подготовлен (127.0.0.1:${DASH_PORT}, данные: ${DASH_ROOT}/api/data.html)." "Dashboard prepared (127.0.0.1:${DASH_PORT}, data: ${DASH_ROOT}/api/data.html)."
 }
 
 # Проверка после apply_nginx: вход с паролем; если nginx не понимает bcrypt — переходим на apr1
@@ -1286,18 +1417,78 @@ dash_selftest() {
     cfg="user = \"${u//\"/\\\"}:${p//\"/\\\"}\""
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 -K - "http://127.0.0.1:${DASH_PORT}/api/data.html" <<<"$cfg")
     if [[ "$code" == "500" ]]; then
-        msg_wrn "Nginx не поддерживает bcrypt — пересоздаю файл паролей в формате apr1."
+        msg_wrn "Nginx не поддерживает bcrypt — пересоздаю файл паролей в формате apr1." "Nginx does not support bcrypt — recreating the password file in apr1 format."
         dash_write_htpasswd -m
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 -K - "http://127.0.0.1:${DASH_PORT}/api/data.html" <<<"$cfg")
     fi
     if [[ "$code" == "200" ]]; then
-        msg_ok "Дашборд отвечает, вход с логином и паролем работает."
+        msg_ok "Дашборд отвечает, вход с логином и паролем работает." "The dashboard responds, login with the username and password works."
     else
-        msg_wrn "Дашборд вернул код '${code}' (ожидался 200): см. /var/log/nginx/f2b-dash.error.log"
+        msg_wrn "Дашборд вернул код '${code}' (ожидался 200): см. /var/log/nginx/f2b-dash.error.log" "The dashboard returned code '${code}' (expected 200): see /var/log/nginx/f2b-dash.error.log"
     fi
     if ss -Hltn "sport = :${DASH_PORT}" 2>/dev/null | grep -vq "127.0.0.1:${DASH_PORT}"; then
-        msg_wrn "Порт ${DASH_PORT} слушается не только на 127.0.0.1!"
+        msg_wrn "Порт ${DASH_PORT} слушается не только на 127.0.0.1!" "Port ${DASH_PORT} is listening not only on 127.0.0.1!"
     fi
+}
+
+# Перевод дашборда на английский. Файлы дашборда пишутся на русском, а при английском
+# интерфейсе фразы заменяются по списку "русский|английский" (длинные фразы — раньше коротких).
+dash_localize() {
+    [[ $XLANG == en ]] || return 0
+    local p args=() pairs=(
+        'lang="ru"|lang="en"'
+        'Добро пожаловать!|Welcome!'
+        'Панель статистики Fail2ban|Fail2ban statistics panel'
+        'Для входа нужен включённый JavaScript.|JavaScript is required to sign in.'
+        'Введите имя пользователя и пароль|Enter the username and password'
+        'Неверное имя пользователя или пароль|Wrong username or password'
+        'Имя пользователя|Username'
+        'Сессия завершена: пароль был изменён. Войдите снова.|Session ended: the password was changed. Sign in again.'
+        'Данные ещё не сформированы. Подождите минуту и попробуйте снова.|Data is not ready yet. Wait a minute and try again.'
+        'Слишком много попыток. Подождите немного.|Too many attempts. Please wait a little.'
+        'Ошибка обновления: |Update error: '
+        'Ошибка сервера: |Server error: '
+        'Нет связи с сервером|No connection to the server'
+        'Проверка…|Checking…'
+        'Обновлено: |Updated: '
+        '>Пароль<|>Password<'
+        'Войти|Sign in'
+        'Обновить|Refresh'
+        'Выйти|Sign out'
+        'Защита от подбора паролей по SSH|Protection against SSH password guessing'
+        'Блокировка ботов и поиска уязвимостей|Blocks bots and vulnerability scanners'
+        'Защита от флуда и перебора путей|Protection against floods and path probing'
+        'Защита от подбора паролей на сайте|Protection against website password guessing'
+        'Джейл «|Jail «'
+        '» не найден или fail2ban не запущен.|» not found or fail2ban is not running.'
+        'Забаненных IP нет|No banned IPs'
+        'Забанено сейчас|Banned now'
+        'Банов всего|Total bans'
+        'Ошибок сейчас|Failures now'
+        'Ошибок всего|Total failures'
+        'Вывод fail2ban-client status|Output of fail2ban-client status'
+        'Джейлов активно|Active jails'
+        'Служба fail2ban|fail2ban service'
+        'Последние события|Recent events'
+        'Событий пока нет|No events yet'
+        'Восстановлен|Restored'
+        'Разбан|Unbanned'
+        '>Бан<|>Banned<'
+        'Не найден|Not found'
+        'Активен|Active'
+        'Работает|Running'
+        'Остановлена|Stopped'
+        '>Джейлы<|>Jails<'
+        '>Джейл<|>Jail<'
+        '>Время<|>Time<'
+        '>Действие<|>Action<'
+        '>IP-адрес<|>IP address<'
+        'аптайм|uptime'
+        'нагрузка|load'
+        'н/д|n/a'
+    )
+    for p in "${pairs[@]}"; do args+=(-e "s|${p%%|*}|${p#*|}|g"); done
+    sed -i "${args[@]}" "${DASH_ROOT}/index.html" "${DASH_ROOT}/assets/app.js" "$DASH_GEN"
 }
 
 dash_remove_files() {
@@ -1740,16 +1931,19 @@ GEN_EOF
 # ─── Меню [4]: Fail2ban и дашборд ────────────────────────────────────────────
 f2b_status() {
     if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1; then
-        echo -e "  Fail2ban: \e[1;32mработает\e[0m ($(fail2ban-client status 2>/dev/null | sed -nE 's/.*Jail list:[[:space:]]*//p'))"
+        say "  Fail2ban: \e[1;32mработает\e[0m ($(fail2ban-client status 2>/dev/null | sed -nE 's/.*Jail list:[[:space:]]*//p'))" "  Fail2ban: \e[1;32mrunning\e[0m ($(fail2ban-client status 2>/dev/null | sed -nE 's/.*Jail list:[[:space:]]*//p'))"
     elif command -v fail2ban-client >/dev/null 2>&1; then
-        echo -e "  Fail2ban: \e[1;33mустановлен, не запущен\e[0m"
+        say "  Fail2ban: \e[1;33mустановлен, не запущен\e[0m" "  Fail2ban: \e[1;33minstalled, not running\e[0m"
     else
-        echo -e "  Fail2ban: \e[1;33mне установлен\e[0m"
+        say "  Fail2ban: \e[1;33mне установлен\e[0m" "  Fail2ban: \e[1;33mnot installed\e[0m"
     fi
     if [[ -n "$F2B_PATH" ]]; then
-        echo -e "  Дашборд:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (логин: $(cut -d: -f1 "$DASH_HTPASSWD" 2>/dev/null | head -1))"
+        local dash_login
+        dash_login=$(cut -d: -f1 "$DASH_HTPASSWD" 2>/dev/null | head -1)
+        say "  Дашборд:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (логин: ${dash_login})" \
+            "  Dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (login: ${dash_login})"
     else
-        echo -e "  Дашборд:  \e[1;33mне установлен\e[0m"
+        say "  Дашборд:  \e[1;33mне установлен\e[0m" "  Dashboard: \e[1;33mnot installed\e[0m"
     fi
 }
 
@@ -1757,26 +1951,26 @@ f2b_status() {
 summary_append_dash() {
     {
         echo
-        echo "Дашборд Fail2ban — обновлено $(date '+%d.%m.%Y %H:%M')"
-        echo "  Ссылка:  https://${MAIN_DOMAIN}/${F2B_PATH}/"
-        echo "  Логин:   ${DASH_USER}"
-        echo "  Пароль:  ${DASH_PASS}"
+        say "Дашборд Fail2ban — обновлено $(date '+%d.%m.%Y %H:%M')" "Fail2ban dashboard — updated $(date '+%d.%m.%Y %H:%M')"
+        say "  Ссылка:  https://${MAIN_DOMAIN}/${F2B_PATH}/" "  Link:      https://${MAIN_DOMAIN}/${F2B_PATH}/"
+        say "  Логин:   ${DASH_USER}" "  Login:     ${DASH_USER}"
+        echo "$(L "  Пароль:  " "  Password:  ")${DASH_PASS}"      # без echo -e: в пароле могут быть обратные слэши
     } >> "$SUMMARY_FILE"
     chmod 600 "$SUMMARY_FILE"
 }
 
 f2b_dash_setup() {
     dash_ask_credentials
-    f2b_install || msg_wrn "Fail2ban не настроен — дашборд будет без данных."
+    f2b_install || msg_wrn "Fail2ban не настроен — дашборд будет без данных." "Fail2ban is not configured — the dashboard will have no data."
     if dash_install; then
         save_state
         apply_nginx
         dash_selftest
         summary_append_dash
         echo
-        echo "  Дашборд: https://${MAIN_DOMAIN}/${F2B_PATH}/"
-        echo "  Логин:   ${DASH_USER}"
-        echo "  Пароль:  ${DASH_PASS}"
+        say "  Дашборд: https://${MAIN_DOMAIN}/${F2B_PATH}/" "  Dashboard: https://${MAIN_DOMAIN}/${F2B_PATH}/"
+        say "  Логин:   ${DASH_USER}" "  Login:     ${DASH_USER}"
+        echo "$(L "  Пароль:  " "  Password:  ")${DASH_PASS}"      # без echo -e: в пароле могут быть обратные слэши
     fi
     DASH_PASS=""
 }
@@ -1788,45 +1982,45 @@ action_f2b() {
     local c
     while true; do
         echo
-        echo -e "\e[1;36m── Fail2ban и дашборд ──\e[0m"
+        say "\e[1;36m── Fail2ban и дашборд ──\e[0m" "\e[1;36m── Fail2ban and dashboard ──\e[0m"
         f2b_status
         echo
-        echo "  [1] Установить / обновить Fail2ban и дашборд"
-        echo "  [2] Сменить логин и пароль дашборда"
-        echo "  [3] Удалить дашборд (Fail2ban остаётся)"
-        echo "  [4] Удалить Fail2ban и дашборд"
-        echo "  [5] Установить / обновить только Fail2ban (без дашборда)"
-        echo "  [0] Назад"
-        read -rp "  Выберите пункт: " c
+        say "  [1] Установить / обновить Fail2ban и дашборд" "  [1] Install / update Fail2ban and the dashboard"
+        say "  [2] Сменить логин и пароль дашборда" "  [2] Change the dashboard login and password"
+        say "  [3] Удалить дашборд (Fail2ban остаётся)" "  [3] Remove the dashboard (Fail2ban stays)"
+        say "  [4] Удалить Fail2ban и дашборд" "  [4] Remove Fail2ban and the dashboard"
+        say "  [5] Установить / обновить только Fail2ban (без дашборда)" "  [5] Install / update Fail2ban only (no dashboard)"
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
         if [[ $INSTALLED == n && "$c" =~ ^[123]$ ]]; then
-            msg_wrn "Дашборду нужна установленная 3x-ui (пункт [1] главного меню)."
-            msg_inf "Сам Fail2ban можно поставить уже сейчас — пункт [5]."
+            msg_wrn "Дашборду нужна установленная 3x-ui (пункт [1] главного меню)." "The dashboard requires an installed 3x-ui (item [1] of the main menu)."
+            msg_inf "Сам Fail2ban можно поставить уже сейчас — пункт [5]." "Fail2ban itself can be installed right now — item [5]."
             continue
         fi
         case "$c" in
             1)  f2b_dash_setup ;;
             5)  f2b_install ;;
-            2)  if [[ -z "$F2B_PATH" ]]; then msg_wrn "Дашборд не установлен."; continue; fi
+            2)  if [[ -z "$F2B_PATH" ]]; then msg_wrn "Дашборд не установлен." "The dashboard is not installed."; continue; fi
                 dash_ask_credentials
                 if dash_write_htpasswd -B; then
                     dash_selftest
                     summary_append_dash
-                    echo "  Логин: ${DASH_USER}   Пароль: ${DASH_PASS}"
+                    echo "$(L "  Логин: " "  Login: ")${DASH_USER}   $(L "Пароль: " "Password: ")${DASH_PASS}"
                 else
-                    msg_wrn "Не удалось обновить файл паролей."
+                    msg_wrn "Не удалось обновить файл паролей." "Failed to update the password file."
                 fi
                 DASH_PASS="" ;;
-            3)  confirm "Удалить дашборд Fail2ban?" n || continue
+            3)  confirml "Удалить дашборд Fail2ban?" "Remove the Fail2ban dashboard?" n || continue
                 dash_remove_files; save_state; apply_nginx
-                msg_ok "Дашборд удалён." ;;
-            4)  confirm "Удалить Fail2ban вместе с дашбордом?" n || continue
+                msg_ok "Дашборд удалён." "Dashboard removed." ;;
+            4)  confirml "Удалить Fail2ban вместе с дашбордом?" "Remove Fail2ban together with the dashboard?" n || continue
                 if [[ $INSTALLED == y ]]; then dash_remove_files; save_state; apply_nginx; fi
                 systemctl stop fail2ban 2>/dev/null
                 apt-get purge -y fail2ban >/dev/null 2>&1
                 rm -rf /etc/fail2ban
-                msg_ok "Fail2ban и дашборд удалены." ;;
+                msg_ok "Fail2ban и дашборд удалены." "Fail2ban and the dashboard removed." ;;
             0)  return ;;
-            *)  msg_wrn "Нет такого пункта." ;;
+            *)  msg_wrn "Нет такого пункта." "No such item." ;;
         esac
     done
 }
@@ -1843,39 +2037,39 @@ check_os() {
         debian:12|debian:13)                      return 0 ;;
         ubuntu:22.04|ubuntu:24.04|ubuntu:26.04)   return 0 ;;
     esac
-    msg_wrn "Скрипт рассчитан на Debian 12/13 и Ubuntu 22.04/24.04/26.04, обнаружено: ${id} ${ver}."
-    confirm "Продолжить на свой риск?" n || return 1
+    msg_wrn "Скрипт рассчитан на Debian 12/13 и Ubuntu 22.04/24.04/26.04, обнаружено: ${id} ${ver}." "The script is designed for Debian 12/13 and Ubuntu 22.04/24.04/26.04, detected: ${id} ${ver}."
+    confirml "Продолжить на свой риск?" "Continue at your own risk?" n || return 1
 }
 
 collect_install_settings() {
-    echo; msg_inf "── Проект ──"
+    echo; msg_inf "── Проект ──" "── Project ──"
     # Необязательно: пустое значение оставляет имя подписки по умолчанию
-    ask PROJECT_NAME "Название вашего VPN-проекта, видно клиентам в приложении (Enter — пропустить)"
+    askl PROJECT_NAME "Название вашего VPN-проекта, видно клиентам в приложении (Enter — пропустить)" "Name of your VPN project, shown to clients in the app (Enter — skip)"
 
-    echo; msg_inf "── Панель 3x-ui ──"
+    echo; msg_inf "── Панель 3x-ui ──" "── 3x-ui panel ──"
     while true; do
-        ask PANEL_USER "Логин панели"
+        askl PANEL_USER "Логин панели" "Panel login"
         [[ "$PANEL_USER" =~ ^[A-Za-z0-9_.-]{3,}$ ]] && break
-        msg_wrn "Логин: минимум 3 символа, латиница/цифры/._-"
+        msg_wrn "Логин: минимум 3 символа, латиница/цифры/._-" "Login: at least 3 characters, Latin letters/digits/._-"
     done
     PANEL_PASS_GENERATED=n
     while true; do
-        read -rsp "Пароль панели (Enter = сгенерировать): " PANEL_PASS; echo
+        read -rsp "$(L "Пароль панели (Enter = сгенерировать): " "Panel password (Enter = generate): ")" PANEL_PASS; echo
         if [[ -z "$PANEL_PASS" ]]; then
             PANEL_PASS=$(gen_random_string 20); PANEL_PASS_GENERATED=y; break
         fi
         local again
-        read -rsp "Повторите пароль: " again; echo
+        read -rsp "$(L "Повторите пароль: " "Repeat the password: ")" again; echo
         [[ "$PANEL_PASS" == "$again" ]] && break
-        msg_wrn "Пароли не совпадают."
+        msg_wrn "Пароли не совпадают." "Passwords do not match."
     done
 
-    echo; msg_inf "── Домены (A-записи должны указывать на этот сервер) ──"
-    ask_domain MAIN_DOMAIN "Основной домен (панель, подписка, сайт-заглушка)"
+    echo; msg_inf "── Домены (A-записи должны указывать на этот сервер) ──" "── Domains (A records must point to this server) ──"
+    ask_domain MAIN_DOMAIN "$(L "Основной домен (панель, подписка, сайт-заглушка)" "Main domain (panel, subscription, decoy site)")"
     while true; do
-        ask_domain REALITY_DOMAIN "Резервный домен (SNI/target для Reality)"
+        ask_domain REALITY_DOMAIN "$(L "Резервный домен (SNI/target для Reality)" "Reserve domain (SNI/target for Reality)")"
         [[ "$REALITY_DOMAIN" != "$MAIN_DOMAIN" ]] && break
-        msg_wrn "Домены должны различаться."
+        msg_wrn "Домены должны различаться." "The domains must be different."
     done
 
     # Внутренние порты и секретные пути: наружу видны только https://домен/путь/
@@ -1888,21 +2082,21 @@ collect_install_settings() {
     SUB_PATH=$(gen_random_string 12)
     JSON_PATH=$(gen_random_string 12)
 
-    echo; msg_inf "── Подключения (inbounds) ──"
+    echo; msg_inf "── Подключения (inbounds) ──" "── Connections (inbounds) ──"
     collect_inbounds_loop
 
-    echo; msg_inf "── Защита ──"
+    echo; msg_inf "── Защита ──" "── Protection ──"
     # Fail2ban можно поставить с дашбордом, без него или не ставить вовсе
     local f2b_choice
     INSTALL_F2B=n; INSTALL_DASH=n
     echo "  Fail2ban:"
-    echo "    1) Установить Fail2ban и веб-дашборд статистики"
-    echo "    2) Установить только Fail2ban (без дашборда)"
-    echo "    3) Не устанавливать"
+    say "    1) Установить Fail2ban и веб-дашборд статистики" "    1) Install Fail2ban and the statistics web dashboard"
+    say "    2) Установить только Fail2ban (без дашборда)" "    2) Install Fail2ban only (no dashboard)"
+    say "    3) Не устанавливать" "    3) Do not install"
     while true; do
-        ask f2b_choice "  Выбор" "1"
+        askl f2b_choice "  Выбор" "  Choice" "1"
         [[ "$f2b_choice" =~ ^[123]$ ]] && break
-        msg_wrn "Введите 1, 2 или 3."
+        msg_wrn "Введите 1, 2 или 3." "Enter 1, 2 or 3."
     done
     case "$f2b_choice" in
         1) INSTALL_F2B=y; INSTALL_DASH=y; dash_ask_credentials ;;
@@ -1910,21 +2104,21 @@ collect_install_settings() {
     esac
 
     INSTALL_GEOIP=n
-    if confirm "Включить защиту GeoIP для админ-панелей?" n; then
+    if confirml "Включить защиту GeoIP для админ-панелей?" "Enable GeoIP protection for the admin panels?" n; then
         INSTALL_GEOIP=y
-        msg_wrn "Панель и дашборд будут открываться только из ${GEOIP_ALLOW_COUNTRY} и с адресов whitelist."
-        msg_wrn "VPN-подключения и подписки это не затрагивает — они доступны из любой страны."
+        msg_wrn "Панель и дашборд будут открываться только из ${GEOIP_ALLOW_COUNTRY} и с адресов whitelist." "The panel and dashboard will open only from ${GEOIP_ALLOW_COUNTRY} and whitelisted addresses."
+        msg_wrn "VPN-подключения и подписки это не затрагивает — они доступны из любой страны." "VPN connections and subscriptions are not affected — they are reachable from any country."
         whitelist_ask
     fi
 }
 
 install_packages() {
-    msg_inf "Установка пакетов..."
+    msg_inf "Установка пакетов..." "Installing packages..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || die "apt-get update не выполнен"
+    apt-get update -y || die "apt-get update не выполнен" "apt-get update failed"
     apt-get install -y curl wget tar jq sqlite3 openssl ca-certificates tzdata ufw \
         nginx-full libnginx-mod-stream certbot psmisc iproute2 \
-        || die "Не удалось установить пакеты"
+        || die "Не удалось установить пакеты" "Failed to install packages"
 }
 
 get_server_ip() {
@@ -1937,19 +2131,19 @@ check_dns() {
     for d in "$@"; do
         a=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}')
         if [[ "$a" != "$IP4" ]]; then
-            msg_wrn "$d → ${a:-не резолвится}, ожидался $IP4"
+            msg_wrn "$d → ${a:-не резолвится}, ожидался $IP4" "$d → ${a:-does not resolve}, expected $IP4"
             bad=y
         fi
     done
     if [[ $bad == y ]]; then
-        confirm "DNS не совпадает с IP сервера (за NAT это нормально). Продолжить?" n || die "Отменено."
+        confirml "DNS не совпадает с IP сервера (за NAT это нормально). Продолжить?" "DNS does not match the server IP (this is normal behind NAT). Continue?" n || die "Отменено." "Cancelled."
     fi
 }
 
 # UFW: только SSH, 80, 443. Панель, подписка и inbounds — на loopback за nginx.
 # Старые правила сбрасываются (ufw сам делает их бэкап в /etc/ufw).
 setup_firewall() {
-    msg_inf "Настройка UFW..."
+    msg_inf "Настройка UFW..." "Configuring UFW..."
     local ssh_ports p
     ssh_ports=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
     [[ -z "$ssh_ports" ]] && ssh_ports=22
@@ -1962,12 +2156,12 @@ setup_firewall() {
     ufw default allow outgoing >/dev/null
     for p in $ssh_ports; do
         ufw allow "${p}/tcp" >/dev/null
-        [[ "$p" != "22" ]] && msg_wrn "SSH слушает нестандартный порт ${p} — он оставлен открытым."
+        [[ "$p" != "22" ]] && msg_wrn "SSH слушает нестандартный порт ${p} — он оставлен открытым." "SSH listens on a non-standard port ${p} — it is left open."
     done
     ufw allow 80/tcp  >/dev/null
     ufw allow 443/tcp >/dev/null
     ufw --force enable >/dev/null
-    msg_ok "UFW: открыты только SSH(${ssh_ports//$'\n'/,}), 80, 443."
+    msg_ok "UFW: открыты только SSH(${ssh_ports//$'\n'/,}), 80, 443." "UFW: only SSH(${ssh_ports//$'\n'/,}), 80 and 443 are open."
 }
 
 _arch() {
@@ -1979,7 +2173,7 @@ _arch() {
         armv6*)                  echo 'armv6' ;;
         armv5*)                  echo 'armv5' ;;
         s390x)                   echo 's390x' ;;
-        *) die "Неподдерживаемая архитектура CPU: $(uname -m)" ;;
+        *) die "Неподдерживаемая архитектура CPU: $(uname -m)" "Unsupported CPU architecture: $(uname -m)" ;;
     esac
 }
 
@@ -1989,12 +2183,12 @@ install_panel() {
 
     tag=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" \
           | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
-    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "Не удалось получить версию 3x-ui с GitHub."
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "Не удалось получить версию 3x-ui с GitHub." "Failed to get the 3x-ui version from GitHub."
 
-    msg_inf "Установка 3x-ui ${tag} (${arch})..."
+    msg_inf "Установка 3x-ui ${tag} (${arch})..." "Installing 3x-ui ${tag} (${arch})..."
     url="https://github.com/MHSanaei/3x-ui/releases/download/${tag}/x-ui-linux-${arch}.tar.gz"
-    wget -q --show-progress -O /tmp/x-ui.tar.gz "$url" || die "Не удалось скачать $url"
-    tar -xzf /tmp/x-ui.tar.gz -C /usr/local/ || die "Ошибка распаковки архива"
+    wget -q --show-progress -O /tmp/x-ui.tar.gz "$url" || die "Не удалось скачать $url" "Failed to download $url"
+    tar -xzf /tmp/x-ui.tar.gz -C /usr/local/ || die "Ошибка распаковки архива" "Archive extraction failed"
     rm -f /tmp/x-ui.tar.gz
 
     chmod +x "$XUI_DIR/x-ui" "$XUI_DIR"/bin/xray-linux-* 2>/dev/null
@@ -2007,13 +2201,13 @@ install_panel() {
     if wget -q --show-progress -O /usr/bin/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh; then
         chmod +x /usr/bin/x-ui
     else
-        msg_wrn "Не удалось скачать x-ui.sh (штатное меню панели), продолжаю без него."
+        msg_wrn "Не удалось скачать x-ui.sh (штатное меню панели), продолжаю без него." "Failed to download x-ui.sh (the stock panel menu), continuing without it."
     fi
 
     # systemd unit: в новых релизах — x-ui.service.debian, в старых — x-ui.service
     if   [[ -f "$XUI_DIR/x-ui.service.debian" ]]; then cp -f "$XUI_DIR/x-ui.service.debian" /etc/systemd/system/x-ui.service
     elif [[ -f "$XUI_DIR/x-ui.service" ]];        then cp -f "$XUI_DIR/x-ui.service"        /etc/systemd/system/x-ui.service
-    else die "В архиве не найден systemd unit x-ui."; fi
+    else die "В архиве не найден systemd unit x-ui." "systemd unit x-ui not found in the archive."; fi
     systemctl daemon-reload
     systemctl enable x-ui >/dev/null 2>&1
     # Панель запускается только после полной настройки, чтобы ни секунды не слушать 0.0.0.0
@@ -2022,18 +2216,18 @@ install_panel() {
 # set_setting KEY VALUE — запись в таблицу settings (key/value)
 set_setting() {
     sqlite3 "$XUIDB" "DELETE FROM settings WHERE key='$1'; INSERT INTO settings (key,value) VALUES ('$1','$(sq "$2")');" \
-        || die "Ошибка записи настройки $1"
+        || die "Ошибка записи настройки $1" "Failed to write setting $1"
 }
 
 configure_panel() {
-    msg_inf "Настройка панели..."
+    msg_inf "Настройка панели..." "Configuring the panel..."
     # Логин/пароль/порт/путь пишем штатным CLI: он создаёт БД и хеширует пароль так,
     # как этого ждёт текущая версия панели. Прямой INSERT пароля в users сломал бы вход.
     "$XUI_DIR/x-ui" setting -username "$PANEL_USER" -password "$PANEL_PASS" \
         -port "$PANEL_PORT" -webBasePath "$PANEL_PATH" >/dev/null \
-        || die "x-ui setting завершился с ошибкой"
+        || die "x-ui setting завершился с ошибкой" "x-ui setting failed"
     "$XUI_DIR/x-ui" migrate >/dev/null 2>&1 || true
-    [[ -f "$XUIDB" ]] || die "База $XUIDB не создана."
+    [[ -f "$XUIDB" ]] || die "База $XUIDB не создана." "Database $XUIDB was not created."
 
     # Панель — только loopback, без собственного TLS: HTTPS и чистый URL даёт nginx
     set_setting webListen   "127.0.0.1"
@@ -2072,59 +2266,59 @@ EOF
 }
 
 restart_xui() {
-    systemctl restart x-ui || die "x-ui не запустился: journalctl -u x-ui -n 50"
+    systemctl restart x-ui || die "x-ui не запустился: journalctl -u x-ui -n 50" "x-ui did not start: journalctl -u x-ui -n 50"
     sleep 2
-    systemctl is-active --quiet x-ui || die "x-ui не активен: journalctl -u x-ui -n 50"
-    msg_ok "x-ui перезапущен."
+    systemctl is-active --quiet x-ui || die "x-ui не активен: journalctl -u x-ui -n 50" "x-ui is not active: journalctl -u x-ui -n 50"
+    msg_ok "x-ui перезапущен." "x-ui restarted."
 }
 
 show_results() {
     {
-        echo "══════════════════════════ Установка завершена ══════════════════════════"
-        [[ -n "$PROJECT_NAME" ]] && echo "Проект: ${PROJECT_NAME}"
+        say "══════════════════════════ Установка завершена ══════════════════════════" "══════════════════════════ Installation complete ══════════════════════════"
+        [[ -n "$PROJECT_NAME" ]] && say "Проект: ${PROJECT_NAME}" "Project: ${PROJECT_NAME}"
         echo
-        echo "┌─ Панель 3x-ui"
-        echo "│  Ссылка:  https://${MAIN_DOMAIN}/${PANEL_PATH}/"
-        echo "│  Логин:   ${PANEL_USER}"
-        echo "│  Пароль:  ${PANEL_PASS}"
+        say "┌─ Панель 3x-ui" "┌─ 3x-ui panel"
+        say "│  Ссылка:  https://${MAIN_DOMAIN}/${PANEL_PATH}/" "│  Link:      https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+        say "│  Логин:   ${PANEL_USER}" "│  Login:     ${PANEL_USER}"
+        echo "$(L "│  Пароль:  " "│  Password:  ")${PANEL_PASS}"   # без echo -e: в пароле могут быть обратные слэши
         if [[ -n "$F2B_PATH" ]]; then
-            echo "├─ Дашборд Fail2ban"
-            echo "│  Ссылка:  https://${MAIN_DOMAIN}/${F2B_PATH}/"
-            echo "│  Логин:   ${DASH_USER}"
-            echo "│  Пароль:  ${DASH_PASS}"
+            say "├─ Дашборд Fail2ban" "├─ Fail2ban dashboard"
+            say "│  Ссылка:  https://${MAIN_DOMAIN}/${F2B_PATH}/" "│  Link:      https://${MAIN_DOMAIN}/${F2B_PATH}/"
+            say "│  Логин:   ${DASH_USER}" "│  Login:     ${DASH_USER}"
+            echo "$(L "│  Пароль:  " "│  Password:  ")${DASH_PASS}"
         fi
-        echo "├─ Подписка"
-        echo "│  Ссылка:  https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>"
+        say "├─ Подписка" "├─ Subscription"
+        say "│  Ссылка:  https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>" "│  Link:      https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>"
         echo "│  JSON:    https://${MAIN_DOMAIN}/${JSON_PATH}/<subId>"
-        echo "└─ Защита"
+        say "└─ Защита" "└─ Protection"
         if [[ $GEOIP_ENABLED == y ]]; then
-            echo "   GeoIP:    включён — панель и дашборд только из ${GEOIP_ALLOW_COUNTRY} и whitelist"
+            say "   GeoIP:    включён — панель и дашборд только из ${GEOIP_ALLOW_COUNTRY} и whitelist" "   GeoIP:    enabled — panel and dashboard only from ${GEOIP_ALLOW_COUNTRY} and the whitelist"
         else
-            echo "   GeoIP:    выключен"
+            say "   GeoIP:    выключен" "   GeoIP:    disabled"
         fi
         if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1; then
-            echo "   Fail2ban: работает"
+            say "   Fail2ban: работает" "   Fail2ban: running"
         else
-            echo "   Fail2ban: не установлен"
+            say "   Fail2ban: не установлен" "   Fail2ban: not installed"
         fi
-        echo "   VPN и подписки доступны из любой страны, наружу открыты только SSH, 80 и 443."
+        say "   VPN и подписки доступны из любой страны, наружу открыты только SSH, 80 и 443." "   VPN and subscriptions are reachable from any country; only SSH, 80 and 443 are open."
         echo
-        echo "Подключения:"
+        say "Подключения:" "Connections:"
         list_inbounds
         echo
-        echo "Клиентов добавьте в панели (для VLESS TCP+Reality выберите flow xtls-rprx-vision)."
+        say "Клиентов добавьте в панели (для VLESS TCP+Reality выберите flow xtls-rprx-vision)." "Add clients in the panel (for VLESS TCP+Reality choose flow xtls-rprx-vision)."
         echo "══════════════════════════════════════════════════════════════════"
     } | tee "$SUMMARY_FILE"
     chmod 600 "$SUMMARY_FILE"
-    msg_ok "Сводка сохранена в ${SUMMARY_FILE}"
+    msg_ok "Сводка сохранена в ${SUMMARY_FILE}" "Summary saved to ${SUMMARY_FILE}"
 }
 
 action_install() {
     check_os || return
 
     if [[ -f "$XUIDB" || -d "$XUI_DIR" ]]; then
-        msg_wrn "Обнаружена существующая установка 3x-ui."
-        confirm "УДАЛИТЬ её вместе с базой (все подключения и клиенты будут потеряны) и поставить заново?" n || return
+        msg_wrn "Обнаружена существующая установка 3x-ui." "An existing 3x-ui installation was detected."
+        confirml "УДАЛИТЬ её вместе с базой (все подключения и клиенты будут потеряны) и поставить заново?" "DELETE it together with the database (all connections and clients will be lost) and install again?" n || return
         # Останавливаем сразу, чтобы порты старых подключений можно было выбрать снова
         systemctl stop x-ui 2>/dev/null || true
     fi
@@ -2138,7 +2332,7 @@ action_install() {
     done
 
     echo
-    if ! confirm "Начать установку? (доменов: ${#domains[@]}, подключений: ${#P_PORT[@]})" y; then
+    if ! confirml "Начать установку? (доменов: ${#domains[@]}, подключений: ${#P_PORT[@]})" "Start the installation? (domains: ${#domains[@]}, connections: ${#P_PORT[@]})" y; then
         # Отмена: возвращаем к работе прежнюю установку, если она была
         [[ -f "$XUIDB" ]] && systemctl start x-ui 2>/dev/null
         return
@@ -2149,15 +2343,15 @@ action_install() {
     check_dns "${domains[@]}"
     setup_firewall
 
-    msg_inf "Выпуск сертификатов Let's Encrypt..."
+    msg_inf "Выпуск сертификатов Let's Encrypt..." "Issuing Let's Encrypt certificates..."
     for s in "${domains[@]}"; do
-        issue_cert "$s" || die "Не удалось выпустить сертификат для $s (проверьте DNS и порт 80)."
+        issue_cert "$s" || die "Не удалось выпустить сертификат для $s (проверьте DNS и порт 80)." "Failed to issue a certificate for $s (check DNS and port 80)."
     done
     setup_renewal_hooks
 
     # Удаление прежней установки (подтверждено выше), база сохраняется в /root
     systemctl stop x-ui 2>/dev/null || true
-    [[ -f "$XUIDB" ]] && cp -a "$XUIDB" "/root/x-ui.db.bak.$(date +%s)" && msg_inf "Бэкап старой базы сохранён в /root/."
+    [[ -f "$XUIDB" ]] && cp -a "$XUIDB" "/root/x-ui.db.bak.$(date +%s)" && msg_inf "Бэкап старой базы сохранён в /root/." "A backup of the old database was saved to /root/."
     rm -rf "$XUI_DIR" /etc/x-ui /etc/systemd/system/x-ui.service
 
     install_panel
@@ -2177,7 +2371,7 @@ action_install() {
     # сразу добавил location дашборда и GeoIP-проверку в панель и дашборд.
     [[ $INSTALL_GEOIP == y ]] && geoip_enable
     if [[ $INSTALL_F2B == y ]]; then
-        f2b_install || msg_wrn "Fail2ban не настроен."
+        f2b_install || msg_wrn "Fail2ban не настроен." "Fail2ban is not configured."
         [[ $INSTALL_DASH == y ]] && dash_install
     fi
     save_state
@@ -2197,16 +2391,16 @@ action_add() {
     require_install || return
     find_xray
 
-    echo "Текущие подключения:"; list_inbounds; echo
+    say "Текущие подключения:" "Current connections:"; list_inbounds; echo
     P_REMARK=(); P_PORT=(); P_PROTO=(); P_NET=(); P_SEC=(); P_SNI=()
     collect_one_inbound
 
     local sni="${P_SNI[0]}"
     if [[ -n "$sni" ]]; then
-        msg_inf "Выпуск сертификата для ${sni} (nginx остановится на несколько секунд)..."
+        msg_inf "Выпуск сертификата для ${sni} (nginx остановится на несколько секунд)..." "Issuing a certificate for ${sni} (nginx will stop for a few seconds)..."
         if ! issue_cert "$sni"; then
             systemctl start nginx 2>/dev/null || true
-            msg_wrn "Не удалось выпустить сертификат для ${sni} (проверьте DNS и порт 80). Подключение не добавлено."
+            msg_wrn "Не удалось выпустить сертификат для ${sni} (проверьте DNS и порт 80). Подключение не добавлено." "Failed to issue a certificate for ${sni} (check DNS and port 80). The connection was not added."
             return
         fi
     fi
@@ -2214,7 +2408,7 @@ action_add() {
     db_add_inbound "${P_REMARK[0]}" "${P_PORT[0]}" "${P_PROTO[0]}" "${P_NET[0]}" "${P_SEC[0]}" "$sni"
     apply_nginx
     restart_xui
-    msg_ok "Готово. Добавьте клиентов в панели: https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+    msg_ok "Готово. Добавьте клиентов в панели: https://${MAIN_DOMAIN}/${PANEL_PATH}/" "Done. Add clients in the panel: https://${MAIN_DOMAIN}/${PANEL_PATH}/"
 }
 
 ###############################################################################
@@ -2224,39 +2418,39 @@ action_modify() {
     require_install || return
     find_xray
 
-    echo "Подключения:"; list_inbounds; echo
+    say "Подключения:" "Connections:"; list_inbounds; echo
     local id row old_proto old_stream old_sni old_reality settings sni=""
-    ask id "ID подключения для изменения"
-    [[ "$id" =~ ^[0-9]+$ ]] || { msg_wrn "Некорректный ID."; return; }
+    askl id "ID подключения для изменения" "ID of the connection to change"
+    [[ "$id" =~ ^[0-9]+$ ]] || { msg_wrn "Некорректный ID." "Invalid ID."; return; }
     row=$(inbounds_json | jq -c --argjson id "$id" '.[] | select(.id == $id)')
-    [[ -n "$row" ]] || { msg_wrn "Подключение #${id} не найдено."; return; }
+    [[ -n "$row" ]] || { msg_wrn "Подключение #${id} не найдено." "Connection #${id} not found."; return; }
 
     old_proto=$(jq -r '.protocol' <<<"$row")
     old_stream=$(jq -r '.stream_settings' <<<"$row")
-    old_sni=$(jq -r '.realitySettings.serverNames[0] // empty' <<<"$old_stream" 2>/dev/null)
+    old_sni=$(jq -r '.realitySettings.serverNames[0] // .tlsSettings.serverName // empty' <<<"$old_stream" 2>/dev/null)
     old_reality=$(jq -c '.realitySettings // empty' <<<"$old_stream" 2>/dev/null)
 
     choose_variant
 
     # Смена протокола делает прежних клиентов недействительными (UUID ≠ пароль Trojan/SS)
     if [[ "$V_PROTO" != "$old_proto" ]]; then
-        msg_wrn "Протокол меняется (${old_proto} → ${V_PROTO}): клиенты этого подключения будут удалены."
-        confirm "Продолжить?" n || return
+        msg_wrn "Протокол меняется (${old_proto} → ${V_PROTO}): клиенты этого подключения будут удалены." "The protocol changes (${old_proto} → ${V_PROTO}): the clients of this connection will be removed."
+        confirml "Продолжить?" "Continue?" n || return
         settings=$(build_settings "$V_PROTO")
     else
         settings=$(jq -r '.settings' <<<"$row")
     fi
 
-    if [[ $V_SEC == reality ]]; then
+    if needs_sni "$V_SEC"; then
         if [[ -n "$old_sni" ]]; then
-            sni="$old_sni"                      # домен и ключи Reality остаются прежними
+            sni="$old_sni"                      # домен (и ключи Reality, если они были) остаются прежними
         else
             ask_sni sni
             old_reality=""
-            msg_inf "Выпуск сертификата для ${sni} (nginx остановится на несколько секунд)..."
+            msg_inf "Выпуск сертификата для ${sni} (nginx остановится на несколько секунд)..." "Issuing a certificate for ${sni} (nginx will stop for a few seconds)..."
             if ! issue_cert "$sni"; then
                 systemctl start nginx 2>/dev/null || true
-                msg_wrn "Не удалось выпустить сертификат для ${sni}. Подключение не изменено."
+                msg_wrn "Не удалось выпустить сертификат для ${sni}. Подключение не изменено." "Failed to issue a certificate for ${sni}. The connection was not changed."
                 return
             fi
         fi
@@ -2268,7 +2462,7 @@ action_modify() {
     add_external_proxy "$V_SEC" "$sni"
 
     sqlite3 "$XUIDB" "UPDATE inbounds SET protocol='${V_PROTO}', settings='$(sq "$settings")',
-        stream_settings='$(sq "$STREAM_JSON")' WHERE id=${id};" || die "Ошибка обновления подключения #${id}"
+        stream_settings='$(sq "$STREAM_JSON")' WHERE id=${id};" || die "Ошибка обновления подключения #${id}" "Failed to update connection #${id}"
     if [[ "$V_PROTO" != "$old_proto" ]]; then
         sqlite3 "$XUIDB" "DELETE FROM client_traffics WHERE inbound_id=${id};" 2>/dev/null || true
     fi
@@ -2276,16 +2470,16 @@ action_modify() {
 
     apply_nginx
     restart_xui
-    msg_ok "Подключение #${id} изменено: ${V_PROTO}, ${V_NET}, ${V_SEC}. Клиентам нужно обновить подписку."
+    msg_ok "Подключение #${id} изменено: ${V_PROTO}, ${V_NET}, ${V_SEC}. Клиентам нужно обновить подписку." "Connection #${id} changed: ${V_PROTO}, ${V_NET}, ${V_SEC}. Clients need to refresh the subscription."
 }
 
 ###############################################################################
 # [4] ПОЛНОЕ УДАЛЕНИЕ
 ###############################################################################
 action_uninstall() {
-    msg_wrn "Будут удалены: 3x-ui с базой (все подключения и клиенты), nginx со всеми конфигами,"
-    msg_wrn "сайт-заглушка, Fail2ban с дашбордом и GeoIP-защита."
-    confirm "Продолжить удаление?" n || return
+    msg_wrn "Будут удалены: 3x-ui с базой (все подключения и клиенты), nginx со всеми конфигами," "Will be removed: 3x-ui with its database (all connections and clients), nginx with all configs,"
+    msg_wrn "сайт-заглушка, Fail2ban с дашбордом и GeoIP-защита." "the decoy site, Fail2ban with the dashboard and GeoIP protection."
+    confirml "Продолжить удаление?" "Continue the removal?" n || return
 
     systemctl stop x-ui 2>/dev/null || true
     systemctl disable x-ui 2>/dev/null || true
@@ -2312,20 +2506,20 @@ action_uninstall() {
                net.ipv6.conf.lo.disable_ipv6=0 2>/dev/null || true
 
     # У Let's Encrypt лимит выпусков на домен, поэтому сертификаты по умолчанию остаются
-    if confirm "Удалить также certbot и все сертификаты Let's Encrypt (/etc/letsencrypt)?" n; then
+    if confirml "Удалить также certbot и все сертификаты Let's Encrypt (/etc/letsencrypt)?" "Also remove certbot and all Let's Encrypt certificates (/etc/letsencrypt)?" n; then
         apt-get purge -y certbot >/dev/null 2>&1 || true
         rm -rf /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt
     fi
-    if confirm "Сбросить и выключить UFW (сервер останется без фаервола)?" n; then
+    if confirml "Сбросить и выключить UFW (сервер останется без фаервола)?" "Reset and disable UFW (the server will be left without a firewall)?" n; then
         ufw --force reset >/dev/null 2>&1 || true
         ufw disable >/dev/null 2>&1 || true
     fi
     apt-get autoremove -y >/dev/null 2>&1 || true
-    msg_ok "3x-ui и nginx удалены."
+    msg_ok "3x-ui и nginx удалены." "3x-ui and nginx removed."
 
-    if confirm "Удалить и сам скрипт ($0) вместе с командой xpro?" n; then
-        rm -f -- "$0" "$XPRO_BIN"
-        msg_ok "Скрипт удалён."
+    if confirml "Удалить и сам скрипт ($0) вместе с командой xpro?" "Remove the script itself ($0) together with the xpro command?" n; then
+        rm -f -- "$0" "$XPRO_BIN" "$LANG_FILE"
+        msg_ok "Скрипт удалён." "Script removed."
         exit 0
     fi
 }
@@ -2338,19 +2532,19 @@ action_uninstall() {
 # с закрытыми паролями, открытым текстом — только по явному подтверждению.
 action_access() {
     if [[ ! -s "$SUMMARY_FILE" ]]; then
-        msg_wrn "Файл ${SUMMARY_FILE} не найден (он создаётся при установке и мог быть удалён)."
+        msg_wrn "Файл ${SUMMARY_FILE} не найден (он создаётся при установке и мог быть удалён)." "File ${SUMMARY_FILE} not found (it is created during installation and may have been deleted)."
         if load_state 2>/dev/null; then
-            echo "  Панель:   https://${MAIN_DOMAIN}/${PANEL_PATH}/"
-            [[ -n "$F2B_PATH" ]] && echo "  Дашборд:  https://${MAIN_DOMAIN}/${F2B_PATH}/"
-            echo "  Подписка: https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>"
-            echo "  Пароли нигде больше не хранятся: дашборд — пункт [4], панель — команда x-ui."
+            say "  Панель:   https://${MAIN_DOMAIN}/${PANEL_PATH}/" "  Panel:        https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+            [[ -n "$F2B_PATH" ]] && say "  Дашборд:  https://${MAIN_DOMAIN}/${F2B_PATH}/" "  Dashboard:    https://${MAIN_DOMAIN}/${F2B_PATH}/"
+            say "  Подписка: https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>" "  Subscription: https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>"
+            say "  Пароли нигде больше не хранятся: дашборд — пункт [4], панель — команда x-ui." "  Passwords are not stored anywhere else: dashboard — item [4], panel — the x-ui command."
         fi
         return
     fi
 
-    sed -E 's/(Пароль:[[:space:]]*).*/\1********/' "$SUMMARY_FILE"
+    sed -E 's/((Пароль|Password):[[:space:]]*).*/\1********/' "$SUMMARY_FILE"
     echo
-    if confirm "Отобразить пароли открытым текстом?" n; then
+    if confirml "Отобразить пароли открытым текстом?" "Show the passwords in plain text?" n; then
         echo
         cat "$SUMMARY_FILE"
     fi
@@ -2373,28 +2567,39 @@ box_line() {      # $1 — текст (по центру), $2 — ANSI-стил�
     printf '\e[1;36m║\e[0m%*s\e[%sm%s\e[0m%*s\e[1;36m║\e[0m\n' "$l" '' "${2:-0}" "$t" "$r" ''
 }
 
+box_right() {     # $1 — текст (прижат к правому краю), $2 — ANSI-стиль текста
+    local t="$1" l
+    l=$(( BOX_W - ${#t} - 2 ))
+    printf '\e[1;36m║\e[0m%*s\e[%sm%s\e[0m  \e[1;36m║\e[0m\n' "$l" '' "${2:-0}" "$t"
+}
+
 show_menu() {
-    local status="не установлен"
-    systemctl is-active --quiet x-ui 2>/dev/null && status="работает"
-    [[ "$status" == "не установлен" && -f "$XUIDB" ]] && status="установлен, остановлен"
+    local status
+    if systemctl is-active --quiet x-ui 2>/dev/null; then
+        status=$(L "работает" "running")
+    elif [[ -f "$XUIDB" ]]; then
+        status=$(L "установлен, остановлен" "installed, stopped")
+    else
+        status=$(L "не установлен" "not installed")
+    fi
 
     clear 2>/dev/null || true
     box_border "╔" "╗"
     box_line ""
     box_line "xpro v${XPRO_VERSION} — Secure VPN Deploy" "1;37"
     box_line "3x-ui · Nginx SNI · Reality · Fail2ban · GeoIP · 443" "0;36"
-    box_line ""
+    box_right "by sheijuro" "2;37"
     box_border "╚" "╝"
     # Сообщение об установке команды xpro показываем один раз (clear стирает вывод до меню)
     if [[ -n "$XPRO_NOTE" ]]; then
         echo -e "  \e[1;32m${XPRO_NOTE}\e[0m"
         XPRO_NOTE=""
     fi
-    echo -e "  Состояние 3x-ui: \e[1;33m${status}\e[0m"
+    say "  Состояние 3x-ui: \e[1;33m${status}\e[0m" "  3x-ui status: \e[1;33m${status}\e[0m"
     if load_state 2>/dev/null; then
-        echo -e "  Панель:  \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
-        [[ -n "$F2B_PATH" ]] && echo -e "  Дашборд: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
-        [[ $GEOIP_ENABLED == y ]] && echo -e "  GeoIP:   \e[1;32mвключён\e[0m (панель и дашборд — только ${GEOIP_ALLOW_COUNTRY} и whitelist)"
+        say "  Панель:  \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" "  Panel:     \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
+        [[ -n "$F2B_PATH" ]] && say "  Дашборд: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" "  Dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
+        [[ $GEOIP_ENABLED == y ]] && say "  GeoIP:   \e[1;32mвключён\e[0m (панель и дашборд — только ${GEOIP_ALLOW_COUNTRY} и whitelist)" "  GeoIP:     \e[1;32menabled\e[0m (panel and dashboard — only ${GEOIP_ALLOW_COUNTRY} and the whitelist)"
     fi
     echo
     # Пункты про саму панель (2, 3, 7) без установленной 3x-ui не показываем.
@@ -2402,18 +2607,19 @@ show_menu() {
     INSTALLED=n
     [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && INSTALLED=y
 
-    echo -e "  \e[1;32m[1]\e[0m Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)"
+    say "  \e[1;32m[1]\e[0m Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" "  \e[1;32m[1]\e[0m Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
     if [[ $INSTALLED == y ]]; then
-        echo -e "  \e[1;32m[2]\e[0m Добавить новое подключение (inbound)"
-        echo -e "  \e[1;32m[3]\e[0m Изменить существующее подключение (смена протокола/транспорта)"
+        say "  \e[1;32m[2]\e[0m Добавить новое подключение (inbound)" "  \e[1;32m[2]\e[0m Add a new connection (inbound)"
+        say "  \e[1;32m[3]\e[0m Изменить существующее подключение (смена протокола/транспорта)" "  \e[1;32m[3]\e[0m Change an existing connection (protocol/transport)"
     fi
-    echo -e "  \e[1;32m[4]\e[0m Управление Fail2ban и дашбордом (установить / удалить / сменить пароль)"
-    echo -e "  \e[1;32m[5]\e[0m Управление GeoIP и Whitelist (включить / отключить / добавить IP)"
-    echo -e "  \e[1;31m[6]\e[0m Полное удаление всего"
+    say "  \e[1;32m[4]\e[0m Управление Fail2ban и дашбордом (установить / удалить / сменить пароль)" "  \e[1;32m[4]\e[0m Manage Fail2ban and the dashboard (install / remove / change password)"
+    say "  \e[1;32m[5]\e[0m Управление GeoIP и Whitelist (включить / отключить / добавить IP)" "  \e[1;32m[5]\e[0m Manage GeoIP and Whitelist (enable / disable / add IP)"
+    say "  \e[1;31m[6]\e[0m Полное удаление всего" "  \e[1;31m[6]\e[0m Full removal of everything"
     if [[ $INSTALLED == y ]]; then
-        echo -e "  \e[1;32m[7]\e[0m Показать доступы (панель, дашборд, подписки)"
+        say "  \e[1;32m[7]\e[0m Показать доступы (панель, дашборд, подписки)" "  \e[1;32m[7]\e[0m Show access details (panel, dashboard, subscriptions)"
     fi
-    echo -e "  \e[1;37m[0]\e[0m Выход"
+    echo -e "  \e[1;32m[8]\e[0m Язык / Language"
+    say "  \e[1;37m[0]\e[0m Выход" "  \e[1;37m[0]\e[0m Exit"
     echo
 }
 
@@ -2430,13 +2636,15 @@ install_xpro() {
     [[ "$self" == "$XPRO_BIN" ]] && return 0
     cmp -s "$self" "$XPRO_BIN" 2>/dev/null && return 0
 
-    local what="установлена"
-    [[ -f "$XPRO_BIN" ]] && what="обновлена"
+    local what
+    what=$(L "установлена" "installed")
+    [[ -f "$XPRO_BIN" ]] && what=$(L "обновлена" "updated")
     if install -m 755 "$self" "$XPRO_BIN"; then
-        XPRO_NOTE="Команда xpro ${what}: теперь меню можно вызывать из любого места — sudo xpro"
+        XPRO_NOTE=$(L "Команда xpro ${what}: теперь меню можно вызывать из любого места — sudo xpro" \
+                      "The xpro command is ${what}: the menu can now be opened from anywhere — sudo xpro")
         msg_ok "$XPRO_NOTE"
     else
-        msg_wrn "Не удалось скопировать скрипт в ${XPRO_BIN}."
+        msg_wrn "Не удалось скопировать скрипт в ${XPRO_BIN}." "Failed to copy the script to ${XPRO_BIN}."
     fi
 }
 
@@ -2444,7 +2652,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        read -rp "  Выберите пункт: " choice
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" choice
         echo
         # Скрытые пункты нельзя вызвать и вводом номера вручную
         if [[ $INSTALLED == n && "$choice" =~ ^[237]$ ]]; then choice="скрыт"; fi
@@ -2456,11 +2664,13 @@ main_menu() {
             5) action_geoip ;;
             6) action_uninstall; pause ;;
             7) action_access;    pause ;;
+            8) choose_lang ;;
             0) exit 0 ;;
-            *) msg_wrn "Нет такого пункта."; sleep 1 ;;
+            *) msg_wrn "Нет такого пункта." "No such item."; sleep 1 ;;
         esac
     done
 }
 
+load_lang || choose_lang       # язык спрашивается один раз, при первом запуске
 install_xpro
 main_menu
