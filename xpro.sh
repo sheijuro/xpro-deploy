@@ -26,6 +26,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
+XPRO_VERSION="1.1.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -967,7 +968,8 @@ geoip_status() {
 }
 
 action_geoip() {
-    require_install || return
+    # Без установленной панели доступен только whitelist: защищать GeoIP пока нечего
+    if [[ $INSTALLED == y ]]; then require_install || return; fi
     local c ip
     while true; do
         echo
@@ -981,6 +983,11 @@ action_geoip() {
         echo "  [5] Обновить базу GeoIP"
         echo "  [0] Назад"
         read -rp "  Выберите пункт: " c
+        if [[ $INSTALLED == n && "$c" =~ ^[125]$ ]]; then
+            msg_wrn "GeoIP защищает панель и дашборд — сначала установите 3x-ui (пункт [1] главного меню)."
+            msg_inf "Whitelist можно заполнить уже сейчас (пункты [3] и [4]): он применится при включении."
+            continue
+        fi
         case "$c" in
             1)  msg_wrn "Если вы сами не в ${GEOIP_ALLOW_COUNTRY} и вашего IP нет в whitelist — панель перестанет открываться."
                 msg_wrn "Вернуть доступ можно будет по SSH: это меню, пункт [2]."
@@ -1066,7 +1073,12 @@ ignoreregex = "(?:GET|HEAD) /(?:favicon\.ico|robots\.txt|sitemap\.xml|apple-touc
 EOF
 
     [[ -f "$F2B_JAIL_LOCAL" ]] && cp -a "$F2B_JAIL_LOCAL" "${F2B_JAIL_LOCAL}.bak"
-    [[ -f /var/log/nginx/access.log ]] || touch /var/log/nginx/access.log
+    # Nginx-джейлы добавляем, только если nginx установлен: без его лога Fail2ban не запустится
+    local with_nginx=n
+    if command -v nginx >/dev/null 2>&1 && [[ -d /var/log/nginx ]]; then
+        with_nginx=y
+        [[ -f /var/log/nginx/access.log ]] || touch /var/log/nginx/access.log
+    fi
     cat > "$F2B_JAIL_LOCAL" <<EOF
 # Сгенерировано xpro.sh
 # ВАЖНО: логи Xray / 3x-ui здесь намеренно НЕ подключены, порт 443 (VPN) не банится.
@@ -1096,6 +1108,9 @@ ${ssh_logpath}
 maxretry = 4
 findtime = 10m
 bantime  = 2h
+EOF
+
+    [[ $with_nginx == y ]] && cat >> "$F2B_JAIL_LOCAL" <<EOF
 
 # Nginx: читается access.log сайта, бан — только на порту 80 (443 защищён от банов)
 [nginx-scanners]
@@ -1140,7 +1155,11 @@ EOF
         fail2ban-client ping >/dev/null 2>&1 && {
             msg_ok "Fail2ban запущен."
             echo "      SSH:       порт ${ssh_ports}, источник логов: ${ssh_backend}"
-            echo "      Nginx:     джейлы банят только порт 80"
+            if [[ $with_nginx == y ]]; then
+                echo "      Nginx:     джейлы банят только порт 80"
+            else
+                echo "      Nginx:     не установлен — джейлы Nginx добавятся после установки 3x-ui"
+            fi
             echo "      Порт 443:  не банится никогда (VPN)"
             echo "      ignoreip:  ${ignoreip}"
             return 0
@@ -1763,7 +1782,9 @@ f2b_dash_setup() {
 }
 
 action_f2b() {
-    require_install || return
+    # Без установленной панели доступен только сам Fail2ban (защита SSH);
+    # дашборду нужен основной домен и Nginx от установки 3x-ui.
+    if [[ $INSTALLED == y ]]; then require_install || return; fi
     local c
     while true; do
         echo
@@ -1774,10 +1795,17 @@ action_f2b() {
         echo "  [2] Сменить логин и пароль дашборда"
         echo "  [3] Удалить дашборд (Fail2ban остаётся)"
         echo "  [4] Удалить Fail2ban и дашборд"
+        echo "  [5] Установить / обновить только Fail2ban (без дашборда)"
         echo "  [0] Назад"
         read -rp "  Выберите пункт: " c
+        if [[ $INSTALLED == n && "$c" =~ ^[123]$ ]]; then
+            msg_wrn "Дашборду нужна установленная 3x-ui (пункт [1] главного меню)."
+            msg_inf "Сам Fail2ban можно поставить уже сейчас — пункт [5]."
+            continue
+        fi
         case "$c" in
             1)  f2b_dash_setup ;;
+            5)  f2b_install ;;
             2)  if [[ -z "$F2B_PATH" ]]; then msg_wrn "Дашборд не установлен."; continue; fi
                 dash_ask_credentials
                 if dash_write_htpasswd -B; then
@@ -1792,7 +1820,7 @@ action_f2b() {
                 dash_remove_files; save_state; apply_nginx
                 msg_ok "Дашборд удалён." ;;
             4)  confirm "Удалить Fail2ban вместе с дашбордом?" n || continue
-                dash_remove_files; save_state; apply_nginx
+                if [[ $INSTALLED == y ]]; then dash_remove_files; save_state; apply_nginx; fi
                 systemctl stop fail2ban 2>/dev/null
                 apt-get purge -y fail2ban >/dev/null 2>&1
                 rm -rf /etc/fail2ban
@@ -1821,7 +1849,8 @@ check_os() {
 
 collect_install_settings() {
     echo; msg_inf "── Проект ──"
-    ask PROJECT_NAME "Название вашего VPN-проекта (видно клиентам в приложении)" "My VPN"
+    # Необязательно: пустое значение оставляет имя подписки по умолчанию
+    ask PROJECT_NAME "Название вашего VPN-проекта, видно клиентам в приложении (Enter — пропустить)"
 
     echo; msg_inf "── Панель 3x-ui ──"
     while true; do
@@ -1863,11 +1892,22 @@ collect_install_settings() {
     collect_inbounds_loop
 
     echo; msg_inf "── Защита ──"
-    INSTALL_F2B=n
-    if confirm "Установить Fail2ban и веб-дашборд?" y; then
-        INSTALL_F2B=y
-        dash_ask_credentials
-    fi
+    # Fail2ban можно поставить с дашбордом, без него или не ставить вовсе
+    local f2b_choice
+    INSTALL_F2B=n; INSTALL_DASH=n
+    echo "  Fail2ban:"
+    echo "    1) Установить Fail2ban и веб-дашборд статистики"
+    echo "    2) Установить только Fail2ban (без дашборда)"
+    echo "    3) Не устанавливать"
+    while true; do
+        ask f2b_choice "  Выбор" "1"
+        [[ "$f2b_choice" =~ ^[123]$ ]] && break
+        msg_wrn "Введите 1, 2 или 3."
+    done
+    case "$f2b_choice" in
+        1) INSTALL_F2B=y; INSTALL_DASH=y; dash_ask_credentials ;;
+        2) INSTALL_F2B=y ;;
+    esac
 
     INSTALL_GEOIP=n
     if confirm "Включить защиту GeoIP для админ-панелей?" n; then
@@ -2041,7 +2081,7 @@ restart_xui() {
 show_results() {
     {
         echo "══════════════════════════ Установка завершена ══════════════════════════"
-        echo "Проект: ${PROJECT_NAME}"
+        [[ -n "$PROJECT_NAME" ]] && echo "Проект: ${PROJECT_NAME}"
         echo
         echo "┌─ Панель 3x-ui"
         echo "│  Ссылка:  https://${MAIN_DOMAIN}/${PANEL_PATH}/"
@@ -2137,8 +2177,8 @@ action_install() {
     # сразу добавил location дашборда и GeoIP-проверку в панель и дашборд.
     [[ $INSTALL_GEOIP == y ]] && geoip_enable
     if [[ $INSTALL_F2B == y ]]; then
-        f2b_install || msg_wrn "Fail2ban не настроен — дашборд будет без данных."
-        dash_install
+        f2b_install || msg_wrn "Fail2ban не настроен."
+        [[ $INSTALL_DASH == y ]] && dash_install
     fi
     save_state
 
@@ -2341,7 +2381,7 @@ show_menu() {
     clear 2>/dev/null || true
     box_border "╔" "╗"
     box_line ""
-    box_line "xpro — Secure VPN Deploy" "1;37"
+    box_line "xpro v${XPRO_VERSION} — Secure VPN Deploy" "1;37"
     box_line "3x-ui · Nginx SNI · Reality · Fail2ban · GeoIP · 443" "0;36"
     box_line ""
     box_border "╚" "╝"
@@ -2357,13 +2397,22 @@ show_menu() {
         [[ $GEOIP_ENABLED == y ]] && echo -e "  GeoIP:   \e[1;32mвключён\e[0m (панель и дашборд — только ${GEOIP_ALLOW_COUNTRY} и whitelist)"
     fi
     echo
+    # Пункты про саму панель (2, 3, 7) без установленной 3x-ui не показываем.
+    # Fail2ban и GeoIP видны всегда: часть их функций работает и без панели.
+    INSTALLED=n
+    [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && INSTALLED=y
+
     echo -e "  \e[1;32m[1]\e[0m Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)"
-    echo -e "  \e[1;32m[2]\e[0m Добавить новое подключение (inbound)"
-    echo -e "  \e[1;32m[3]\e[0m Изменить существующее подключение (смена протокола/транспорта)"
+    if [[ $INSTALLED == y ]]; then
+        echo -e "  \e[1;32m[2]\e[0m Добавить новое подключение (inbound)"
+        echo -e "  \e[1;32m[3]\e[0m Изменить существующее подключение (смена протокола/транспорта)"
+    fi
     echo -e "  \e[1;32m[4]\e[0m Управление Fail2ban и дашбордом (установить / удалить / сменить пароль)"
     echo -e "  \e[1;32m[5]\e[0m Управление GeoIP и Whitelist (включить / отключить / добавить IP)"
     echo -e "  \e[1;31m[6]\e[0m Полное удаление всего"
-    echo -e "  \e[1;32m[7]\e[0m Показать доступы (панель, дашборд, подписки)"
+    if [[ $INSTALLED == y ]]; then
+        echo -e "  \e[1;32m[7]\e[0m Показать доступы (панель, дашборд, подписки)"
+    fi
     echo -e "  \e[1;37m[0]\e[0m Выход"
     echo
 }
@@ -2397,6 +2446,8 @@ main_menu() {
         show_menu
         read -rp "  Выберите пункт: " choice
         echo
+        # Скрытые пункты нельзя вызвать и вводом номера вручную
+        if [[ $INSTALLED == n && "$choice" =~ ^[237]$ ]]; then choice="скрыт"; fi
         case "$choice" in
             1) action_install;   pause ;;
             2) action_add;       pause ;;
