@@ -1,8 +1,20 @@
-# 🚀 x-ui-custom (xpro)
+# 🚀 xpro — Secure VPN Deploy
 
 Интерактивный bash-скрипт для установки и управления [3x-ui](https://github.com/MHSanaei/3x-ui) на Debian и Ubuntu.
 
 Весь внешний трафик идёт через один порт — 443. Nginx разводит его по SNI и по пути, а панель, подписка и все подключения слушают только `127.0.0.1`.
+
+## ⚡ Установка
+
+```bash
+wget -O xpro.sh https://raw.githubusercontent.com/sheijuro/x-ui-custom-deploy/main/xpro.sh && sudo bash xpro.sh
+```
+
+После первого запуска меню вызывается из любого места:
+
+```bash
+sudo xpro
+```
 
 ## ✨ Возможности
 
@@ -21,19 +33,7 @@
 - 🖥️ Debian 12/13 или Ubuntu 22.04/24.04/26.04, доступ root
 - 🌐 Два домена (или поддомена) с A-записями на сервер: основной и для Reality
 - ➕ По одному дополнительному домену на каждое следующее Reality-подключение
-
-## ⚡ Установка
-
-```bash
-wget https://raw.githubusercontent.com/ВашНик/название/main/x-ui-custom.sh
-sudo bash x-ui-custom.sh
-```
-
-После первого запуска меню вызывается из любого места:
-
-```bash
-sudo xpro
-```
+- 📡 Подключение к серверу по IPv4 — IPv6 при установке отключается
 
 ## 🧭 Меню
 
@@ -45,6 +45,7 @@ sudo xpro
 | 4️⃣ | Fail2ban и дашборд: установить, удалить, сменить пароль |
 | 5️⃣ | GeoIP и whitelist: включить, отключить, добавить IP |
 | 6️⃣ | Полное удаление |
+| 7️⃣ | Показать доступы (панель, дашборд, подписки) |
 
 ## 🏗️ Как это устроено
 
@@ -63,12 +64,10 @@ sudo xpro
 
 - 🗑️ Пункт 1 на сервере с уже установленной 3x-ui удаляет прежнюю панель и базу. Копия базы сохраняется в `/root/`.
 - 🌍 При включённой GeoIP-защите панель не откроется из другой страны, если вашего IP нет в whitelist. Отключить защиту можно по SSH: `sudo xpro`, пункт 5.
-- 📡 Скрипт рассчитан на IPv4.
+- 🔑 Доступы после установки лежат в `/root/xpro-summary.txt` и показываются пунктом 7.
 
 ## 🙏 Используемые проекты
 
 - [3x-ui](https://github.com/MHSanaei/3x-ui) — панель управления Xray, GPL-3.0
 - [Start Bootstrap](https://github.com/StartBootstrap) — шаблоны сайта-заглушки, MIT
 - [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) — база GeoIP, CC BY 4.0
-
-
