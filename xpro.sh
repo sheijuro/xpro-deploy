@@ -26,7 +26,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.3.1"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.3.2"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -235,7 +235,9 @@ init_used() {
     done < <(inbound_routes)
 }
 
-port_is_listening() { ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+# Здесь и ниже вместо "grep -q" стоит "grep ... >/dev/null": grep -q выходит на первом совпадении,
+# команда слева получает SIGPIPE, и при включённом pipefail весь конвейер считается неудачным.
+port_is_listening() { ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]$1\$" >/dev/null; }
 
 port_is_free() {
     local p
@@ -537,7 +539,7 @@ build_stream() {
 detect_schema() {
     HAS_HOSTS=n; HAS_GROUP_ID=n
     [[ -n "$(sqlite3 "$XUIDB" "SELECT name FROM sqlite_master WHERE type='table' AND name='hosts';")" ]] && HAS_HOSTS=y
-    sqlite3 "$XUIDB" "PRAGMA table_info(hosts);" | grep -qw group_id && HAS_GROUP_ID=y
+    sqlite3 "$XUIDB" "PRAGMA table_info(hosts);" | grep -w group_id >/dev/null && HAS_GROUP_ID=y
     return 0
 }
 
@@ -2728,7 +2730,7 @@ user_del() {
     local email
     askl email "Имя клиента для удаления" "Name of the client to remove"
     [[ "$email" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || { msg_wrn "Некорректное имя." "Invalid name."; return; }
-    if ! clients_rows | cut -d$'\x1f' -f1 | grep -qxF "$email"; then
+    if ! clients_rows | cut -d$'\x1f' -f1 | grep -xF "$email" >/dev/null; then
         msg_wrn "Клиента ${email} нет в базе." "Client ${email} is not in the database."; return
     fi
     confirml "Удалить клиента ${email}? Его ссылка-подписка перестанет работать." \
@@ -2843,7 +2845,8 @@ action_settings() {
 # ─── [4] Статус служб ────────────────────────────────────────────────────────
 svc_line() {      # ИМЯ_СЛУЖБЫ ПОДПИСЬ
     local st
-    if ! systemctl list-unit-files "$1.service" 2>/dev/null | grep -q "$1"; then
+    # Без конвейера с grep -q: при включённом pipefail он обрывал systemctl и давал ложное «не установлена»
+    if [[ -z "$(systemctl list-unit-files "$1.service" --no-legend 2>/dev/null)" ]]; then
         st="\e[1;33m$(L "не установлена" "not installed")\e[0m"
     elif systemctl is-active --quiet "$1"; then
         st="\e[1;32m$(L "работает" "running")\e[0m"
@@ -2858,7 +2861,7 @@ action_status() {
     svc_line nginx    "Nginx"
     svc_line x-ui     "3x-ui"
     svc_line fail2ban "Fail2ban"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if command -v ufw >/dev/null 2>&1 && [[ "$(ufw status 2>/dev/null)" == *"Status: active"* ]]; then
         echo -e "  $(printf '%-10s' "UFW") \e[1;32m$(L "включён" "active")\e[0m"
     else
         echo -e "  $(printf '%-10s' "UFW") \e[1;31m$(L "выключен" "inactive")\e[0m"
