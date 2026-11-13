@@ -26,7 +26,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.3.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.3.1"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -3073,34 +3073,53 @@ install_xpro() {
 # ─── Обновление скрипта ──────────────────────────────────────────────────────
 # При запуске скрипт сверяет свою версию с той, что лежит в репозитории, и только сообщает
 # о новой. Сама замена файла — отдельным пунктом меню и только после подтверждения.
-XPRO_UPDATE_URL="https://raw.githubusercontent.com/sheijuro/x-ui-custom-deploy/main/xpro.sh"
+XPRO_UPDATE_URL="https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/xpro.sh"
 UPDATE_VERSION=""          # номер новой версии, если она есть
 
-xpro_fetch() {             # $1 — куда сохранить ("-" = в stdout); короткий таймаут, чтобы меню не ждало сеть
+# xpro_fetch КУДА [ТАЙМАУТ] [head] — скачать скрипт из репозитория ("-" = в stdout).
+# С третьим аргументом "head" запрашиваются только первые 8 КБ файла: номер версии стоит
+# в самом начале, а качать весь скрипт ради одной строки на медленном канале незачем.
+xpro_fetch() {
+    local out="$1" t="${2:-5}" part="${3:-}"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time "${2:-5}" -o "$1" "$XPRO_UPDATE_URL" 2>/dev/null
+        local args=(-fsSL --max-time "$t" -o "$out")
+        [[ -n "$part" ]] && args+=(-r 0-8191)
+        curl "${args[@]}" "$XPRO_UPDATE_URL" 2>/dev/null
     else
-        wget -q -T "${2:-5}" -t 1 -O "$1" "$XPRO_UPDATE_URL" 2>/dev/null
+        local args=(-q -T "$t" -t 1 -O "$out")
+        [[ -n "$part" ]] && args+=(--header="Range: bytes=0-8191")
+        wget "${args[@]}" "$XPRO_UPDATE_URL" 2>/dev/null
     fi
 }
 
+# check_update [ТАЙМАУТ] — код возврата: 0 — проверка выполнена, 1 — репозиторий не ответил.
+# При сбое сети уже найденная ранее версия не забывается.
 check_update() {
-    local remote
+    local head remote
+    head=$(xpro_fetch - "${1:-5}" head)
+    remote=$(grep -m1 -oP '^XPRO_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' <<<"$head")
+    [[ -n "$remote" ]] || return 1
     UPDATE_VERSION=""
-    remote=$(xpro_fetch - | grep -m1 -oP '^XPRO_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+')
-    [[ -n "$remote" && "$remote" != "$XPRO_VERSION" ]] || return 0
     # Новее ли версия в репозитории, чем текущая
-    if [[ "$(printf '%s\n' "$XPRO_VERSION" "$remote" | sort -V | tail -1)" == "$remote" ]]; then
+    if [[ "$remote" != "$XPRO_VERSION" \
+          && "$(printf '%s\n' "$XPRO_VERSION" "$remote" | sort -V | tail -1)" == "$remote" ]]; then
         UPDATE_VERSION="$remote"
     fi
+    return 0
 }
 
 action_update() {
-    msg_inf "Проверка обновлений..." "Checking for updates..."
-    check_update
+    # Если новая версия уже найдена при запуске, повторно сеть не дёргаем
     if [[ -z "$UPDATE_VERSION" ]]; then
-        msg_ok "Установлена последняя версия (${XPRO_VERSION}) либо репозиторий недоступен." \
-               "You have the latest version (${XPRO_VERSION}), or the repository is unreachable."
+        msg_inf "Проверка обновлений..." "Checking for updates..."
+        if ! check_update 20; then
+            msg_wrn "Репозиторий не ответил — попробуйте ещё раз позже." \
+                    "The repository did not respond — try again later."
+            return
+        fi
+    fi
+    if [[ -z "$UPDATE_VERSION" ]]; then
+        msg_ok "Установлена последняя версия (${XPRO_VERSION})." "You have the latest version (${XPRO_VERSION})."
         return
     fi
     msg_inf "Доступна версия ${UPDATE_VERSION} (у вас ${XPRO_VERSION})." \
@@ -3110,7 +3129,7 @@ action_update() {
 
     local tmp
     tmp=$(mktemp)
-    if ! xpro_fetch "$tmp" 60; then
+    if ! xpro_fetch "$tmp" 120; then
         rm -f "$tmp"
         msg_wrn "Не удалось скачать новую версию." "Failed to download the new version."; return
     fi
