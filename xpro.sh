@@ -26,7 +26,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.2.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.3.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -178,6 +178,14 @@ inbounds_json() {
     echo "${out:-[]}"
 }
 
+# Все подключения из базы, включая созданные вручную в веб-панели (для показа и выбора)
+all_inbounds_json() {
+    local out
+    out=$(sqlite3 -json "$XUIDB" \
+        "SELECT id, remark, listen, port, protocol, stream_settings FROM inbounds ORDER BY id;" 2>/dev/null)
+    echo "${out:-[]}"
+}
+
 # Строки: тип<TAB>порт<TAB>значение.
 #   reality — подключение, которое nginx stream находит по SNI (Reality или собственный TLS), значение = SNI;
 #   ws / grpc / xhttp — подключение за nginx http на основном домене, значение = путь.
@@ -196,12 +204,15 @@ inbound_routes() {
 list_inbounds() {
     printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "ID" "$(L "Название" "Name")" "$(L "Порт" "Port")" \
         "$(L "Протокол" "Protocol")" "$(L "Сеть" "Net")" "$(L "Защита" "Security")"
-    inbounds_json | jq -r --arg via "$(L "TLS через nginx" "TLS via nginx")" '.[]
+    # Подключение, созданное в панели не на 127.0.0.1, через Nginx не идёт и снаружи закрыто фаерволом —
+    # оно помечается, чтобы было видно, почему оно не работает.
+    all_inbounds_json | jq -r --arg via "$(L "TLS через nginx" "TLS via nginx")" \
+        --arg ext "$(L "[не на 127.0.0.1 — снаружи недоступно]" "[not on 127.0.0.1 — unreachable from outside]")" '.[]
         | ((.stream_settings | fromjson?) // {}) as $s
         | [.id, .remark, .port, .protocol, ($s.network // "?"),
            (if   $s.security == "reality" then "Reality, SNI " + ($s.realitySettings.serverNames[0] // "?")
             elif $s.security == "tls"     then "TLS, SNI " + ($s.tlsSettings.serverName // "?")
-            else $via end)]
+            else $via end) + (if .listen != "127.0.0.1" then " " + $ext else "" end)]
         | @tsv' \
     | while IFS=$'\t' read -r id remark port proto net sec; do
         printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "$id" "$remark" "$port" "$proto" "$net" "$sec"
@@ -898,20 +909,34 @@ EOF
 
 # Случайный готовый шаблон (блог, портфолио, лендинг) → /var/www/html
 install_fake_site() {
-    local url tmp src
-    url="${FAKE_SITES[RANDOM % ${#FAKE_SITES[@]}]}"
+    local url tmp src site_name prev="" tries=0
+    # Какой шаблон стоит сейчас — чтобы при смене заглушки не выпал тот же самый.
+    # Отметка лежит вне папки сайта, иначе её можно было бы скачать по ссылке.
+    [[ -f "${STATE_DIR}/site" ]] && prev=$(cat "${STATE_DIR}/site" 2>/dev/null)
+    while true; do
+        url="${FAKE_SITES[RANDOM % ${#FAKE_SITES[@]}]}"
+        site_name=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$url")")")")")
+        tries=$((tries + 1))
+        [[ "$site_name" != "$prev" || $tries -ge 10 ]] && break
+    done
     tmp=$(mktemp -d)
     mkdir -p /var/www/html
     rm -rf /var/www/html/*
 
-    local site_name
-    site_name=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$url")")")")")
     msg_inf "Сайт-заглушка: ${site_name}" "Decoy site: ${site_name}"
     if wget -q --show-progress -T 30 -O "$tmp/site.tar.gz" "$url" && tar -xzf "$tmp/site.tar.gz" -C "$tmp"; then
         src=$(find "$tmp" -maxdepth 2 -type d -name dist | head -1)
         if [[ -n "$src" && -f "$src/index.html" ]]; then
             cp -a "$src"/. /var/www/html/
-            msg_ok "Шаблон сайта установлен." "Site template installed."
+            # Убираем узнаваемую подпись шаблона: на каждом сервере — своё случайное название сайта
+            local brands=("Northwind Studio" "Aurora Labs" "Bluepeak" "Vertex Digital" "Lumen Works"
+                          "Nordic Cloud" "Stonebridge" "Pixelcraft" "Greyline Media" "Summit Systems"
+                          "Harbor & Co" "Silverpine" "Atlas Creative" "Echo Valley" "Brightwave")
+            local brand="${brands[RANDOM % ${#brands[@]}]}"
+            find /var/www/html -maxdepth 1 -name '*.html' -exec sed -i "s/Start Bootstrap/${brand}/g" {} +
+            mkdir -p "$STATE_DIR"
+            echo "$site_name" > "${STATE_DIR}/site"
+            msg_ok "Шаблон сайта установлен, название сайта: ${brand}" "Site template installed, site name: ${brand}"
         fi
     fi
     if [[ ! -f /var/www/html/index.html ]]; then
@@ -2527,27 +2552,410 @@ action_uninstall() {
 ###############################################################################
 # ГЛАВНОЕ МЕНЮ
 ###############################################################################
-# ─── [7] Показать доступы ────────────────────────────────────────────────────
-# Сводка лежит в /root/xpro-summary.txt (права 600). Сначала показываем её
-# с закрытыми паролями, открытым текстом — только по явному подтверждению.
+# ─── Заголовок раздела ───────────────────────────────────────────────────────
+section() { echo; echo -e "\e[1;36m── $(L "$@") ──\e[0m"; }
+
+# ─── [1] Показать доступы ────────────────────────────────────────────────────
+# Всё читается из базы панели в момент вызова, поэтому видны и подключения,
+# и клиенты, созданные позже через веб-панель 3x-ui.
+
+# Строки: email<US>sub_id<US>enable. Новые версии 3x-ui держат клиентов в таблице clients,
+# старые — внутри JSON настроек каждого подключения.
+clients_rows() {
+    if [[ -n "$(sqlite3 "$XUIDB" "SELECT name FROM sqlite_master WHERE type='table' AND name='clients';" 2>/dev/null)" ]]; then
+        sqlite3 -separator $'\x1f' "$XUIDB" "SELECT email, sub_id, enable FROM clients ORDER BY id;" 2>/dev/null
+    else
+        sqlite3 -json "$XUIDB" "SELECT settings FROM inbounds;" 2>/dev/null \
+            | jq -r '[.[] | (.settings | fromjson?) | .clients[]?] | unique_by(.email) | .[]
+                     | [.email, (.subId // ""), (if .enable == false then 0 else 1 end)] | join("\u001f")'
+    fi
+}
+
+list_clients() {
+    local email sub en n=0 mark
+    while IFS=$'\x1f' read -r email sub en; do
+        [[ -n "$email" ]] || continue
+        n=$((n + 1))
+        if [[ "$en" == 0 ]]; then mark="\e[1;31m●\e[0m"; else mark="\e[1;32m●\e[0m"; fi
+        echo -e "  ${mark} \e[1m${email}\e[0m"
+        [[ -n "$sub" ]] && echo "      https://${MAIN_DOMAIN}/${SUB_PATH}/${sub}"
+    done < <(clients_rows)
+    if (( n == 0 )); then
+        say "  (клиентов пока нет — добавьте их в пункте «Управление пользователями»)" \
+            "  (no clients yet — add them under «Manage users»)"
+    else
+        say "  Зелёная точка — клиент включён, красная — отключён. Всего: ${n}" \
+            "  Green dot — client enabled, red — disabled. Total: ${n}"
+    fi
+}
+
 action_access() {
+    load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
+
+    section "Ссылки" "Links"
+    say "  Панель 3x-ui:      \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" \
+        "  3x-ui panel:       \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
+    [[ -n "$F2B_PATH" ]] && say "  Дашборд Fail2ban:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" \
+                                "  Fail2ban dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
+    say "  Подписка клиента:  https://${MAIN_DOMAIN}/${SUB_PATH}/<id клиента>" \
+        "  Client subscription: https://${MAIN_DOMAIN}/${SUB_PATH}/<client id>"
+
+    section "Подключения (сейчас в базе панели)" "Connections (currently in the panel database)"
+    list_inbounds
+
+    section "Клиенты и их ссылки-подписки" "Clients and their subscription links"
+    list_clients
+
+    # Пароли в базе хранятся только в виде хеша, поэтому показать можно лишь те,
+    # что были записаны в файл сводки при установке и при смене пароля дашборда.
+    section "Логины и пароли (сохранены при установке)" "Logins and passwords (saved at installation)"
+    local pat='(Панель 3x-ui|3x-ui panel|Дашборд Fail2ban|Fail2ban dashboard|Логин:|Login:|Пароль:|Password:)'
     if [[ ! -s "$SUMMARY_FILE" ]]; then
-        msg_wrn "Файл ${SUMMARY_FILE} не найден (он создаётся при установке и мог быть удалён)." "File ${SUMMARY_FILE} not found (it is created during installation and may have been deleted)."
-        if load_state 2>/dev/null; then
-            say "  Панель:   https://${MAIN_DOMAIN}/${PANEL_PATH}/" "  Panel:        https://${MAIN_DOMAIN}/${PANEL_PATH}/"
-            [[ -n "$F2B_PATH" ]] && say "  Дашборд:  https://${MAIN_DOMAIN}/${F2B_PATH}/" "  Dashboard:    https://${MAIN_DOMAIN}/${F2B_PATH}/"
-            say "  Подписка: https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>" "  Subscription: https://${MAIN_DOMAIN}/${SUB_PATH}/<subId>"
-            say "  Пароли нигде больше не хранятся: дашборд — пункт [4], панель — команда x-ui." "  Passwords are not stored anywhere else: dashboard — item [4], panel — the x-ui command."
-        fi
+        say "  Файл ${SUMMARY_FILE} удалён. Пароль дашборда меняется в настройках, пароль панели — командой x-ui." \
+            "  File ${SUMMARY_FILE} was removed. Change the dashboard password in settings, the panel password with the x-ui command."
         return
     fi
-
-    sed -E 's/((Пароль|Password):[[:space:]]*).*/\1********/' "$SUMMARY_FILE"
+    grep -E "$pat" "$SUMMARY_FILE" | sed -E 's/((Пароль|Password):[[:space:]]*).*/\1********/'
+    say "  Пароль панели, изменённый потом в самой панели, здесь не обновляется." \
+        "  A panel password changed later inside the panel is not updated here."
     echo
     if confirml "Отобразить пароли открытым текстом?" "Show the passwords in plain text?" n; then
         echo
-        cat "$SUMMARY_FILE"
+        grep -E "$pat" "$SUMMARY_FILE"
     fi
+}
+
+# ─── API панели 3x-ui ────────────────────────────────────────────────────────
+# Клиентов добавляем и удаляем только через штатный API панели: она сама обновляет все
+# связанные таблицы и конфигурацию Xray. Прямая запись в базу здесь была бы ненадёжной.
+API_TOKEN_FILE="${STATE_DIR}/api-token"
+API_BODY=""; API_CODE=""
+
+api_new_token() {
+    local out tok
+    out=$("$XUI_DIR/x-ui" setting -getApiToken -tokenName xpro 2>&1)
+    tok=$(sed -nE 's/^apiToken:[[:space:]]*//p' <<<"$out" | tail -1)
+    [[ -n "$tok" ]] || return 1
+    mkdir -p "$STATE_DIR"
+    ( umask 077; echo "$tok" > "$API_TOKEN_FILE" )
+}
+
+# api_call МЕТОД ПУТЬ [JSON] → ответ в API_BODY, код HTTP в API_CODE
+api_call() {
+    local method="$1" path="$2" data="${3:-}" tok raw attempt
+    local url="http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/panel/api/${path}"
+    for attempt in 1 2; do
+        if [[ ! -s "$API_TOKEN_FILE" ]]; then api_new_token || return 1; fi
+        tok=$(cat "$API_TOKEN_FILE")
+        local args=(-s --max-time 20 -w '\n%{http_code}' -X "$method" -H "Authorization: Bearer ${tok}")
+        [[ -n "$data" ]] && args+=(-H 'Content-Type: application/json' --data "$data")
+        raw=$(curl "${args[@]}" "$url" 2>/dev/null)
+        API_CODE="${raw##*$'\n'}"
+        API_BODY="${raw%$'\n'*}"
+        [[ "$API_CODE" == 401 || "$API_CODE" == 403 ]] || return 0
+        # Токен не принят: выпускаем новый и один раз перезапускаем панель, чтобы она его увидела
+        rm -f "$API_TOKEN_FILE"
+        if (( attempt == 1 )); then
+            api_new_token || return 1
+            systemctl restart x-ui 2>/dev/null
+            sleep 4
+        fi
+    done
+    return 1
+}
+
+api_ok() { jq -e '.success == true' <<<"$API_BODY" >/dev/null 2>&1; }
+
+api_error() {
+    local m
+    m=$(jq -r '.msg // empty' <<<"$API_BODY" 2>/dev/null)
+    msg_wrn "Панель отклонила запрос (код ${API_CODE:-нет ответа}): ${m:-без пояснения}" \
+            "The panel rejected the request (code ${API_CODE:-no response}): ${m:-no details}"
+    say "  Это же действие можно выполнить в веб-панели: https://${MAIN_DOMAIN}/${PANEL_PATH}/" \
+        "  The same action can be done in the web panel: https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+}
+
+# ─── [2] Управление пользователями ───────────────────────────────────────────
+user_add() {
+    local email ids days gb all_ids payload sub exp=0 total=0
+    while true; do
+        askl email "Имя клиента (латиница, цифры, . _ -)" "Client name (Latin letters, digits, . _ -)"
+        [[ "$email" =~ ^[A-Za-z0-9._-]{1,40}$ ]] && break
+        msg_wrn "Допустимы латинские буквы, цифры и . _ - (до 40 символов)." "Latin letters, digits and . _ - are allowed (up to 40 characters)."
+    done
+
+    section "Подключения" "Connections"
+    list_inbounds
+    all_ids=$(all_inbounds_json | jq -r '[.[].id] | join(",")')
+    [[ -n "$all_ids" ]] || { msg_wrn "Сначала создайте хотя бы одно подключение." "Create at least one connection first."; return; }
+    while true; do
+        askl ids "ID подключений через запятую (Enter — все)" "Connection IDs, comma-separated (Enter — all)" "$all_ids"
+        ids="${ids// /}"
+        [[ "$ids" =~ ^[0-9]+(,[0-9]+)*$ ]] && break
+        msg_wrn "Пример: 1,3" "Example: 1,3"
+    done
+    while true; do
+        askl days "Срок действия в днях (0 — бессрочно)" "Validity in days (0 — unlimited)" "0"
+        [[ "$days" =~ ^[0-9]+$ ]] && break
+    done
+    while true; do
+        askl gb "Лимит трафика в ГБ (0 — без лимита)" "Traffic limit in GB (0 — unlimited)" "0"
+        [[ "$gb" =~ ^[0-9]+$ ]] && break
+    done
+    (( days > 0 )) && exp=$(( ( $(date +%s) + days * 86400 ) * 1000 ))
+    (( gb > 0 ))   && total=$(( gb * 1073741824 ))
+    sub=$(gen_random_string 16 | tr 'A-Z' 'a-z')
+
+    payload=$(jq -cn --arg id "$(cat /proc/sys/kernel/random/uuid)" --arg email "$email" --arg sub "$sub" \
+        --arg pw "$(openssl rand -base64 32)" --arg ids "$ids" --argjson exp "$exp" --argjson total "$total" '{
+            client: {id:$id, email:$email, enable:true, subId:$sub, password:$pw, security:"auto", flow:"",
+                     limitIp:0, totalGB:$total, expiryTime:$exp, tgId:0, comment:"", reset:0},
+            inboundIds: [$ids | split(",")[] | tonumber]}')
+
+    msg_inf "Добавляю клиента..." "Adding the client..."
+    if api_call POST "clients/add" "$payload" && api_ok; then
+        msg_ok "Клиент ${email} добавлен." "Client ${email} added."
+        say "  Ссылка-подписка: \e[1;34mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m" \
+            "  Subscription link: \e[1;34mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m"
+        say "  Для VLESS TCP+Reality при желании включите flow xtls-rprx-vision в панели." \
+            "  For VLESS TCP+Reality you may enable flow xtls-rprx-vision in the panel."
+    else
+        api_error
+    fi
+}
+
+user_del() {
+    local email
+    askl email "Имя клиента для удаления" "Name of the client to remove"
+    [[ "$email" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || { msg_wrn "Некорректное имя." "Invalid name."; return; }
+    if ! clients_rows | cut -d$'\x1f' -f1 | grep -qxF "$email"; then
+        msg_wrn "Клиента ${email} нет в базе." "Client ${email} is not in the database."; return
+    fi
+    confirml "Удалить клиента ${email}? Его ссылка-подписка перестанет работать." \
+             "Remove client ${email}? Their subscription link will stop working." n || return
+    if api_call POST "clients/del/${email}" && api_ok; then
+        msg_ok "Клиент ${email} удалён." "Client ${email} removed."
+    else
+        api_error
+    fi
+}
+
+action_users() {
+    load_state 2>/dev/null || return
+    local c
+    while true; do
+        section "Пользователи" "Users"
+        list_clients
+        echo
+        say "  [1] Добавить клиента" "  [1] Add a client"
+        say "  [2] Удалить клиента"  "  [2] Remove a client"
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
+        case "$c" in
+            1) user_add ;;
+            2) user_del ;;
+            0) return ;;
+            *) msg_wrn "Нет такого пункта." "No such item." ;;
+        esac
+    done
+}
+
+# ─── [3] Настройки сервера ───────────────────────────────────────────────────
+# Смена секретных путей. Внутренние порты не меняются: они слушают только 127.0.0.1
+# и снаружи не видны, поэтому менять их незачем.
+action_paths() {
+    local c new
+    while true; do
+        section "Секретные пути" "Secret paths"
+        say "  Панель:   /${PANEL_PATH}/" "  Panel:        /${PANEL_PATH}/"
+        [[ -n "$F2B_PATH" ]] && say "  Дашборд:  /${F2B_PATH}/" "  Dashboard:    /${F2B_PATH}/"
+        say "  Подписка: /${SUB_PATH}/" "  Subscription: /${SUB_PATH}/"
+        echo
+        say "  [1] Сменить путь панели" "  [1] Change the panel path"
+        say "  [2] Сменить путь дашборда" "  [2] Change the dashboard path"
+        say "  [3] Сменить путь подписки (ссылки ВСЕХ клиентов изменятся)" \
+            "  [3] Change the subscription path (links of ALL clients will change)"
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
+        case "$c" in
+            1)  new=$(gen_random_string 14)
+                if "$XUI_DIR/x-ui" setting -webBasePath "$new" >/dev/null 2>&1; then
+                    PANEL_PATH="$new"; save_state; rm -f "$API_TOKEN_FILE"
+                    apply_nginx; restart_xui
+                    msg_ok "Новый адрес панели: https://${MAIN_DOMAIN}/${PANEL_PATH}/" "New panel address: https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+                else
+                    msg_wrn "Панель не приняла новый путь." "The panel rejected the new path."
+                fi ;;
+            2)  if [[ -z "$F2B_PATH" ]]; then msg_wrn "Дашборд не установлен." "The dashboard is not installed."; continue; fi
+                F2B_PATH=$(gen_random_string 12); save_state; apply_nginx
+                msg_ok "Новый адрес дашборда: https://${MAIN_DOMAIN}/${F2B_PATH}/" "New dashboard address: https://${MAIN_DOMAIN}/${F2B_PATH}/" ;;
+            3)  msg_wrn "Старые ссылки-подписки перестанут работать у всех клиентов." "The old subscription links will stop working for all clients."
+                confirml "Точно сменить путь подписки?" "Really change the subscription path?" n || continue
+                SUB_PATH=$(gen_random_string 12)
+                set_setting subPath "/${SUB_PATH}/"
+                set_setting subURI  "https://${MAIN_DOMAIN}/${SUB_PATH}/"
+                save_state; apply_nginx; restart_xui
+                msg_ok "Новая основа ссылок: https://${MAIN_DOMAIN}/${SUB_PATH}/<id клиента>" "New link base: https://${MAIN_DOMAIN}/${SUB_PATH}/<client id>" ;;
+            0)  return ;;
+            *)  msg_wrn "Нет такого пункта." "No such item." ;;
+        esac
+    done
+}
+
+action_settings() {
+    local c
+    [[ $INSTALLED == y ]] && { load_state 2>/dev/null; }
+    while true; do
+        section "Настройки сервера" "Server settings"
+        if [[ $INSTALLED == y ]]; then
+            say "  [1] Добавить подключение (inbound)" "  [1] Add a connection (inbound)"
+            say "  [2] Изменить подключение (протокол / транспорт)" "  [2] Change a connection (protocol / transport)"
+            say "  [3] Сменить сайт-заглушку (другой случайный шаблон)" "  [3] Change the decoy site (another random template)"
+            say "  [4] Сменить секретные пути (панель, дашборд, подписка)" "  [4] Change secret paths (panel, dashboard, subscription)"
+        fi
+        say "  [5] Fail2ban и дашборд" "  [5] Fail2ban and the dashboard"
+        say "  [6] GeoIP и whitelist" "  [6] GeoIP and whitelist"
+        echo "  [7] Язык / Language"
+        [[ $INSTALLED == y ]] && say "  [8] Переустановить 3x-ui с нуля (база будет удалена)" "  [8] Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[9]\e[0m Полное удаление всего" "  \e[1;31m[9]\e[0m Full removal of everything"
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
+        if [[ $INSTALLED == n && "$c" =~ ^[12348]$ ]]; then
+            msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
+            continue
+        fi
+        case "$c" in
+            1) action_add;    pause ;;
+            2) action_modify; pause ;;
+            3) install_fake_site; pause ;;
+            4) action_paths ;;
+            5) action_f2b ;;
+            6) action_geoip ;;
+            7) choose_lang ;;
+            8) action_install; pause; return ;;
+            9) action_uninstall; pause; return ;;
+            0) return ;;
+            *) msg_wrn "Нет такого пункта." "No such item." ;;
+        esac
+    done
+}
+
+# ─── [4] Статус служб ────────────────────────────────────────────────────────
+svc_line() {      # ИМЯ_СЛУЖБЫ ПОДПИСЬ
+    local st
+    if ! systemctl list-unit-files "$1.service" 2>/dev/null | grep -q "$1"; then
+        st="\e[1;33m$(L "не установлена" "not installed")\e[0m"
+    elif systemctl is-active --quiet "$1"; then
+        st="\e[1;32m$(L "работает" "running")\e[0m"
+    else
+        st="\e[1;31m$(L "остановлена" "stopped")\e[0m"
+    fi
+    echo -e "  $(printf '%-10s' "$2") ${st}"
+}
+
+action_status() {
+    section "Службы" "Services"
+    svc_line nginx    "Nginx"
+    svc_line x-ui     "3x-ui"
+    svc_line fail2ban "Fail2ban"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "  $(printf '%-10s' "UFW") \e[1;32m$(L "включён" "active")\e[0m"
+    else
+        echo -e "  $(printf '%-10s' "UFW") \e[1;31m$(L "выключен" "inactive")\e[0m"
+    fi
+
+    section "Версии" "Versions"
+    echo "  xpro:   ${XPRO_VERSION}"
+    [[ -x "$XUI_DIR/x-ui" ]] && echo "  3x-ui:  $("$XUI_DIR/x-ui" -v 2>/dev/null | head -1)"
+    command -v nginx >/dev/null 2>&1 && echo "  nginx:  $(nginx -v 2>&1 | sed 's/^nginx version: //')"
+
+    # Наружу должны смотреть только SSH, 80 и 443 — всё остальное на 127.0.0.1
+    section "Порты, открытые наружу" "Ports listening on external interfaces"
+    ss -Hltn 2>/dev/null | awk '$4 !~ /^(127\.|\[::1\])/ {n=split($4,a,":"); print a[n]}' | sort -un | paste -sd' ' | sed 's/^/  /'
+
+    section "Сертификаты" "Certificates"
+    local d end
+    for d in /etc/letsencrypt/live/*/; do
+        [[ -f "${d}fullchain.pem" ]] || continue
+        end=$(openssl x509 -in "${d}fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+        echo "  $(basename "$d") — $(L "до" "until") ${end}"
+    done
+
+    if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1; then
+        section "Fail2ban: забанено сейчас" "Fail2ban: currently banned"
+        local j
+        for j in $(fail2ban-client status 2>/dev/null | sed -nE 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' ' '); do
+            echo "  ${j}: $(fail2ban-client status "$j" 2>/dev/null | sed -nE 's/.*Currently banned:[[:space:]]*//p')"
+        done
+    fi
+}
+
+# ─── [5] Обновления ──────────────────────────────────────────────────────────
+# Ни одно из обновлений не трогает базу /etc/x-ui/x-ui.db, конфигурацию Nginx,
+# настройки Fail2ban и сертификаты: меняются только программы.
+
+update_system() {
+    confirml "Обновить пакеты системы (apt upgrade)? Настроенные конфиги сохраняются." \
+             "Upgrade system packages (apt upgrade)? Existing config files are kept." y || return
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || { msg_wrn "apt-get update не выполнен." "apt-get update failed."; return; }
+    # --force-confold: при обновлении пакета остаётся наш конфиг (nginx.conf, jail.local и т.д.)
+    if apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef upgrade; then
+        msg_ok "Пакеты системы обновлены." "System packages upgraded."
+        [[ -f /var/run/reboot-required ]] && msg_wrn "Для завершения обновления нужна перезагрузка сервера." "A server reboot is required to finish the upgrade."
+    else
+        msg_wrn "Обновление пакетов завершилось с ошибкой." "Package upgrade failed."
+    fi
+}
+
+# Обновление самой панели: заменяются только программы в /usr/local/x-ui, база остаётся на месте
+update_panel() {
+    [[ -f "$XUIDB" ]] || { msg_wrn "3x-ui не установлена." "3x-ui is not installed."; return; }
+    say "  Сейчас: $("$XUI_DIR/x-ui" -v 2>/dev/null | head -1)" "  Current: $("$XUI_DIR/x-ui" -v 2>/dev/null | head -1)"
+    confirml "Обновить 3x-ui до последней версии? VPN прервётся примерно на минуту, клиенты и настройки сохраняются." \
+             "Update 3x-ui to the latest version? VPN will be interrupted for about a minute; clients and settings are kept." n || return
+
+    cp -a "$XUIDB" "/root/x-ui.db.bak.$(date +%s)"
+    msg_inf "Копия базы сохранена в /root/." "A copy of the database was saved to /root/."
+    systemctl stop x-ui 2>/dev/null
+    # В подоболочке: если загрузка сорвётся, die завершит только её, а старая панель останется целой
+    if ( install_panel ); then
+        "$XUI_DIR/x-ui" migrate >/dev/null 2>&1 || true
+        restart_xui
+        msg_ok "3x-ui обновлена: $("$XUI_DIR/x-ui" -v 2>/dev/null | head -1)" "3x-ui updated: $("$XUI_DIR/x-ui" -v 2>/dev/null | head -1)"
+    else
+        systemctl start x-ui 2>/dev/null
+        msg_wrn "Обновление не удалось — запущена прежняя версия панели." "The update failed — the previous panel version was started."
+    fi
+}
+
+action_updates() {
+    local c
+    while true; do
+        section "Обновления" "Updates"
+        say "  Данные не затрагиваются: база 3x-ui, конфиги Nginx и Fail2ban, сертификаты остаются как есть." \
+            "  Your data is not touched: the 3x-ui database, Nginx and Fail2ban configs and certificates stay as they are."
+        echo
+        if [[ -n "$UPDATE_VERSION" ]]; then
+            say "  \e[1;33m[1]\e[0m Обновить скрипт xpro до ${UPDATE_VERSION} (сейчас ${XPRO_VERSION})" \
+                "  \e[1;33m[1]\e[0m Update the xpro script to ${UPDATE_VERSION} (current ${XPRO_VERSION})"
+        else
+            say "  [1] Проверить обновление скрипта xpro (сейчас ${XPRO_VERSION})" "  [1] Check for an xpro script update (current ${XPRO_VERSION})"
+        fi
+        say "  [2] Обновить пакеты системы" "  [2] Upgrade system packages"
+        say "  [3] Обновить панель 3x-ui" "  [3] Update the 3x-ui panel"
+        say "  [4] Обновить базу GeoIP" "  [4] Update the GeoIP database"
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
+        case "$c" in
+            1) action_update ;;
+            2) update_system ;;
+            3) update_panel ;;
+            4) geoip_download_db || msg_wrn "Не удалось скачать базу." "Failed to download the database." ;;
+            0) return ;;
+            *) msg_wrn "Нет такого пункта." "No such item." ;;
+        esac
+    done
 }
 
 # ─── Рамка шапки меню ────────────────────────────────────────────────────────
@@ -2602,30 +3010,30 @@ show_menu() {
         [[ $GEOIP_ENABLED == y ]] && say "  GeoIP:   \e[1;32mвключён\e[0m (панель и дашборд — только ${GEOIP_ALLOW_COUNTRY} и whitelist)" "  GeoIP:     \e[1;32menabled\e[0m (panel and dashboard — only ${GEOIP_ALLOW_COUNTRY} and the whitelist)"
     fi
     echo
-    # Пункты про саму панель (2, 3, 7) без установленной 3x-ui не показываем.
-    # Fail2ban и GeoIP видны всегда: часть их функций работает и без панели.
+    # Пункты про саму панель без установленной 3x-ui не показываем: вместо них — установка.
     INSTALLED=n
     [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && INSTALLED=y
 
-    say "  \e[1;32m[1]\e[0m Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" "  \e[1;32m[1]\e[0m Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
     if [[ $INSTALLED == y ]]; then
-        say "  \e[1;32m[2]\e[0m Добавить новое подключение (inbound)" "  \e[1;32m[2]\e[0m Add a new connection (inbound)"
-        say "  \e[1;32m[3]\e[0m Изменить существующее подключение (смена протокола/транспорта)" "  \e[1;32m[3]\e[0m Change an existing connection (protocol/transport)"
-    fi
-    say "  \e[1;32m[4]\e[0m Управление Fail2ban и дашбордом (установить / удалить / сменить пароль)" "  \e[1;32m[4]\e[0m Manage Fail2ban and the dashboard (install / remove / change password)"
-    say "  \e[1;32m[5]\e[0m Управление GeoIP и Whitelist (включить / отключить / добавить IP)" "  \e[1;32m[5]\e[0m Manage GeoIP and Whitelist (enable / disable / add IP)"
-    say "  \e[1;31m[6]\e[0m Полное удаление всего" "  \e[1;31m[6]\e[0m Full removal of everything"
-    if [[ $INSTALLED == y ]]; then
-        say "  \e[1;32m[7]\e[0m Показать доступы (панель, дашборд, подписки)" "  \e[1;32m[7]\e[0m Show access details (panel, dashboard, subscriptions)"
-    fi
-    echo -e "  \e[1;32m[8]\e[0m Язык / Language"
-    if [[ -n "$UPDATE_VERSION" ]]; then
-        say "  \e[1;33m[9]\e[0m Обновить скрипт — доступна версия \e[1;33m${UPDATE_VERSION}\e[0m" \
-            "  \e[1;33m[9]\e[0m Update the script — version \e[1;33m${UPDATE_VERSION}\e[0m is available"
+        say "  \e[1;32m[1]\e[0m 🔐 Показать доступы (ссылки, подключения, клиенты)" \
+            "  \e[1;32m[1]\e[0m 🔐 Show access details (links, connections, clients)"
+        say "  \e[1;32m[2]\e[0m 👥 Управление пользователями (добавить / удалить клиента)" \
+            "  \e[1;32m[2]\e[0m 👥 Manage users (add / remove a client)"
     else
-        say "  \e[1;32m[9]\e[0m Проверить обновления скрипта" "  \e[1;32m[9]\e[0m Check for script updates"
+        say "  \e[1;32m[1]\e[0m 🚀 Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" \
+            "  \e[1;32m[1]\e[0m 🚀 Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
     fi
-    say "  \e[1;37m[0]\e[0m Выход" "  \e[1;37m[0]\e[0m Exit"
+    say "  \e[1;32m[3]\e[0m 🛠  Настройки сервера (подключения, заглушка, пути, защита, язык)" \
+        "  \e[1;32m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language)"
+    say "  \e[1;32m[4]\e[0m 📊 Статус служб (Nginx, 3x-ui, Fail2ban)" \
+        "  \e[1;32m[4]\e[0m 📊 Service status (Nginx, 3x-ui, Fail2ban)"
+    if [[ -n "$UPDATE_VERSION" ]]; then
+        say "  \e[1;33m[5]\e[0m 🔄 Обновить систему и скрипт — доступна версия \e[1;33m${UPDATE_VERSION}\e[0m" \
+            "  \e[1;33m[5]\e[0m 🔄 Update the system and script — version \e[1;33m${UPDATE_VERSION}\e[0m is available"
+    else
+        say "  \e[1;32m[5]\e[0m 🔄 Обновить систему и скрипт" "  \e[1;32m[5]\e[0m 🔄 Update the system and script"
+    fi
+    say "  \e[1;37m[0]\e[0m 🚪 Выход" "  \e[1;37m[0]\e[0m 🚪 Exit"
     echo
 }
 
@@ -2727,18 +3135,12 @@ main_menu() {
         show_menu
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" choice
         echo
-        # Скрытые пункты нельзя вызвать и вводом номера вручную
-        if [[ $INSTALLED == n && "$choice" =~ ^[237]$ ]]; then choice="скрыт"; fi
         case "$choice" in
-            1) action_install;   pause ;;
-            2) action_add;       pause ;;
-            3) action_modify;    pause ;;
-            4) action_f2b ;;
-            5) action_geoip ;;
-            6) action_uninstall; pause ;;
-            7) action_access;    pause ;;
-            8) choose_lang ;;
-            9) action_update;    pause ;;
+            1) if [[ $INSTALLED == y ]]; then action_access; else action_install; fi; pause ;;
+            2) if [[ $INSTALLED == y ]]; then action_users; else msg_wrn "Нет такого пункта." "No such item."; sleep 1; fi ;;
+            3) action_settings ;;
+            4) action_status;    pause ;;
+            5) action_updates ;;
             0) exit 0 ;;
             *) msg_wrn "Нет такого пункта." "No such item."; sleep 1 ;;
         esac
