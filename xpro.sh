@@ -3522,8 +3522,8 @@ show_menu() {
         say "  \e[1;32m[1]\e[0m 🚀 Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" \
             "  \e[1;32m[1]\e[0m 🚀 Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
     fi
-    say "  \e[1;32m[3]\e[0m 🛠  Настройки сервера (подключения, заглушка, пути, защита, язык)" \
-        "  \e[1;32m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language)"
+    say "  \e[1;32m[3]\e[0m 🛠  Настройки сервера (подключения, заглушка, пути, защита, язык / language)" \
+        "  \e[1;32m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language / язык)"
     say "  \e[1;32m[4]\e[0m 📊 Статус служб (Nginx, 3x-ui, Fail2ban)" \
         "  \e[1;32m[4]\e[0m 📊 Service status (Nginx, 3x-ui, Fail2ban)"
     if [[ -n "$UPDATE_VERSION" ]]; then
