@@ -2,7 +2,7 @@
 
 **Русский** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-1.3.1-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
+![version](https://img.shields.io/badge/version-1.3.2-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
 
 Интерактивный bash-скрипт для установки и управления [3x-ui](https://github.com/MHSanaei/3x-ui) на Debian и Ubuntu.
 
@@ -11,7 +11,7 @@
 ## ⚡ Установка
 
 ```bash
-wget -O xpro.sh https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/xpro.sh && sudo bash xpro.sh
+wget -4 -O xpro.sh https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/xpro.sh && sudo bash xpro.sh
 ```
 
 После первого запуска меню вызывается из любого места:

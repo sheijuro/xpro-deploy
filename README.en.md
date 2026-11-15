@@ -2,7 +2,7 @@
 
 [Русский](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-1.3.1-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
+![version](https://img.shields.io/badge/version-1.3.2-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
 
 An interactive bash script that installs and manages [3x-ui](https://github.com/MHSanaei/3x-ui) on Debian and Ubuntu.
 
@@ -11,7 +11,7 @@ All external traffic goes through a single port — 443. Nginx routes it by SNI 
 ## ⚡ Installation
 
 ```bash
-wget -O xpro.sh https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/xpro.sh && sudo bash xpro.sh
+wget -4 -O xpro.sh https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/xpro.sh && sudo bash xpro.sh
 ```
 
 After the first run the menu is available from anywhere:
