@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 444" width="760" height="444" role="img" aria-label="Главное меню xpro в терминале">
+  <title>Главное меню xpro</title>
+  <style>
+    text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace; font-size: 15px; fill: #e5e7eb; }
+    .dim { fill: #9ca3af; } .cy { fill: #22d3ee; } .gr { fill: #4ade80; } .ye { fill: #facc15; } .bl { fill: #60a5fa; } .wh { fill: #ffffff; font-weight: 700; }
+  </style>
+
+  <!-- окно терминала -->
+  <rect width="760" height="444" rx="12" fill="#0d1117"/>
+  <rect width="760" height="36" rx="12" fill="#161b22"/>
+  <rect y="24" width="760" height="12" fill="#161b22"/>
+  <circle cx="22" cy="18" r="6" fill="#ff5f57"/><circle cx="42" cy="18" r="6" fill="#febc2e"/><circle cx="62" cy="18" r="6" fill="#28c840"/>
+  <text x="380" y="23" text-anchor="middle" class="dim" style="font-size:13px">root@server: ~ — sudo xpro</text>
+
+  <!-- шапка в двойной рамке -->
+  <rect x="24" y="54" width="712" height="100" fill="none" stroke="#22d3ee" stroke-width="1.5"/>
+  <rect x="28" y="58" width="704" height="92" fill="none" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="380" y="98" text-anchor="middle" class="wh">xpro v1.4.1 — Secure VPN Deploy</text>
+  <text x="380" y="122" text-anchor="middle" class="cy">3x-ui · Nginx SNI · Reality · Fail2ban · GeoIP · 443</text>
+
+  <!-- состояние -->
+  <text x="44" y="186">Состояние 3x-ui: <tspan class="ye">работает</tspan></text>
+  <text x="44" y="208">Панель:  <tspan class="bl">https://panel.example.com/Xk3mQ9pLr2Tn7v/</tspan></text>
+  <text x="44" y="230">Дашборд: <tspan class="bl">https://panel.example.com/b8Hd4WzYq1Ns/</tspan></text>
+
+  <!-- пункты меню -->
+  <text x="44" y="270"><tspan class="gr">[1]</tspan> 🔐 Показать доступы (ссылки, подключения, клиенты)</text>
+  <text x="44" y="292"><tspan class="gr">[2]</tspan> 👥 Управление пользователями (добавить / удалить клиента)</text>
+  <text x="44" y="314"><tspan class="gr">[3]</tspan> 🛠 Настройки сервера (подключения, заглушка, пути, защита, язык / language)</text>
+  <text x="44" y="336"><tspan class="gr">[4]</tspan> 📊 Статус служб (Nginx, 3x-ui, Fail2ban)</text>
+  <text x="44" y="358"><tspan class="gr">[5]</tspan> 🔄 Обновить систему и скрипт</text>
+  <text x="44" y="380"><tspan class="wh">[0]</tspan> 🚪 Выход</text>
+
+  <!-- приглашение -->
+  <text x="44" y="418">Выберите пункт:</text>
+  <rect x="190" y="404" width="9" height="18" fill="#e5e7eb"/>
+</svg>
