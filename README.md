@@ -2,7 +2,7 @@
 
 **Русский** | [English](README.en.md)
 
-![version](https://img.shields.io/badge/version-1.3.2-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
+![version](https://img.shields.io/badge/version-1.4.1-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
 
 Интерактивный bash-скрипт для установки и управления [3x-ui](https://github.com/MHSanaei/3x-ui) на Debian и Ubuntu.
 
