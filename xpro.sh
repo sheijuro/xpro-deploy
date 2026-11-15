@@ -26,7 +26,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.3.2"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.4.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -111,23 +111,45 @@ choose_lang() {
 ask() {
     local __var="$1" __prompt="$2" __def="${3:-}" __ans
     if [[ -n "$__def" ]]; then
-        read -rp "$__prompt [$__def]: " __ans
+        read -rp "$__prompt [$__def]: " __ans || echo
     else
-        read -rp "$__prompt: " __ans
+        read -rp "$__prompt: " __ans || echo
     fi
     __ans="${__ans:-$__def}"
+    __ans="${__ans//[[:cntrl:]]/}"                  # стрелки и прочие управляющие символы — мусор, а не ответ
     __ans="${__ans#"${__ans%%[![:space:]]*}"}"      # обрезаем пробелы по краям
     __ans="${__ans%"${__ans##*[![:space:]]}"}"
     printf -v "$__var" '%s' "$__ans"
 }
 
 # confirm "вопрос" [y|n] — возвращает 0 при "да"
+# Принимается только внятный ответ: опечатка не считается ни согласием, ни отказом — вопрос повторяется.
 confirm() {
     local ans def="${2:-n}"
-    read -rp "$1 (y/n) [$def]: " ans
-    ans="${ans:-$def}"
-    [[ "$ans" =~ ^[YyДд] ]]
+    while true; do
+        read -rp "$1 (y/n) [$def]: " ans || { echo; return 1; }     # ввод закрыт → «нет»
+        ans="${ans:-$def}"
+        case "$ans" in
+            [Yy]|[Yy][Ee][Ss]|[Дд]|[Дд][Аа])  return 0 ;;
+            [Nn]|[Nn][Oo]|[Нн]|[Нн][Ее][Тт])  return 1 ;;
+        esac
+        msg_wrn "Ответьте y (да) или n (нет)." "Answer y (yes) or n (no)."
+    done
 }
+
+# confirm_danger "рус" "eng" — для необратимых действий: нужно набрать слово yes целиком,
+# случайное нажатие Enter или «y» ничего не удалит.
+confirm_danger() {
+    local ans
+    msg_wrn "$1" "$2"
+    read -rp "$(L "Чтобы подтвердить, введите слово yes (Enter — отмена): " "To confirm, type the word yes (Enter — cancel): ")" ans || { echo; return 1; }
+    [[ "$ans" == [Yy][Ee][Ss] ]] && return 0
+    msg_inf "Отменено." "Cancelled."
+    return 1
+}
+
+# has_table ИМЯ — есть ли таблица в базе панели (набор таблиц зависит от версии 3x-ui)
+has_table() { [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='$1';" 2>/dev/null)" ]]; }
 
 # Двуязычные варианты: askl VAR "рус" "eng" [по умолчанию], confirml "рус" "eng" [y|n]
 askl()     { ask "$1" "$(L "$2" "$3")" "${4:-}"; }
@@ -2204,6 +2226,99 @@ _arch() {
     esac
 }
 
+# ─── Загрузка архива 3x-ui ───────────────────────────────────────────────────
+# Прямая загрузка с GitHub у части хостингов идёт со скоростью в десятки КБ/с. Поэтому:
+#   1) сначала GitHub; если скорость 20 секунд подряд ниже порога — попытка прерывается;
+#   2) затем зеркала. Файл с зеркала принимается ТОЛЬКО если его SHA-256 совпал с суммой,
+#      которую отдал сам GitHub (api.github.com): зеркало не может подсунуть другой архив;
+#   3) в конце — снова GitHub, уже без порога скорости (медленно, но надёжно).
+# Недокачанный файл не выбрасывается: следующая попытка продолжает с того же места.
+XPRO_MIRRORS="${XPRO_MIRRORS:-https://ghproxy.net/ https://gh-proxy.com/ https://ghfast.top/}"
+XPRO_MIN_SPEED="${XPRO_MIN_SPEED:-153600}"      # байт/с; ниже этого источник считается слишком медленным
+
+# fetch_progress URL ФАЙЛ [МИН_СКОРОСТЬ] — загрузка с докачкой и шкалой (проценты видны всё время)
+fetch_progress() {
+    local args=(-fL --connect-timeout 10 -C - --progress-bar -o "$2")
+    (( ${3:-0} > 0 )) && args+=(--speed-limit "$3" --speed-time 20)
+    curl "${args[@]}" "$1"
+}
+
+# xui_archive_ok ФАЙЛ SHA256 — целый ли архив (по контрольной сумме, а без неё — по структуре)
+xui_archive_ok() {
+    [[ -s "$1" ]] || return 1
+    if [[ -n "$2" ]]; then
+        [[ "$(sha256sum "$1" | cut -d' ' -f1)" == "$2" ]]
+    else
+        tar -tzf "$1" >/dev/null 2>&1
+    fi
+}
+
+# download_xui ТЕГ АРХИТЕКТУРА ФАЙЛ
+download_xui() {
+    local tag="$1" name="x-ui-linux-${2}.tar.gz" out="$3" meta sha size have src label min n=0
+    local direct="https://github.com/MHSanaei/3x-ui/releases/download/${tag}/x-ui-linux-${2}.tar.gz"
+
+    # Контрольную сумму и размер берём у GitHub напрямую — это маленький запрос, он проходит и на медленном канале
+    meta=$(curl -Ls --max-time 15 "https://api.github.com/repos/MHSanaei/3x-ui/releases/tags/${tag}" 2>/dev/null)
+    sha=$(jq -r --arg n "$name" '.assets[]? | select(.name == $n) | .digest // empty' <<<"$meta" 2>/dev/null)
+    sha="${sha#sha256:}"
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || sha=""
+    size=$(jq -r --arg n "$name" '.assets[]? | select(.name == $n) | .size // empty' <<<"$meta" 2>/dev/null)
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+    # Архив уже лежит на месте и цел (например, скачан заранее) — качать нечего
+    if xui_archive_ok "$out" "$sha"; then
+        msg_ok "Архив 3x-ui уже скачан и проверен." "The 3x-ui archive is already downloaded and verified."
+        return 0
+    fi
+
+    local sources=("GitHub|${direct}|${XPRO_MIN_SPEED}")
+    if [[ -n "$sha" ]]; then
+        for src in $XPRO_MIRRORS; do sources+=("$(L "зеркало" "mirror") ${src#https://}|${src}${direct}|${XPRO_MIN_SPEED}"); done
+    else
+        msg_wrn "GitHub не сообщил контрольную сумму архива — зеркала не используются, качаю только напрямую." \
+                "GitHub did not provide the archive checksum — mirrors are not used, downloading directly only."
+    fi
+    sources+=("GitHub $(L "(без ограничения по скорости)" "(no speed limit)")|${direct}|0")
+
+    (( size > 0 )) && msg_inf "Размер архива: $(( size / 1048576 )) МБ. Шкала ниже показывает ход загрузки." \
+                              "Archive size: $(( size / 1048576 )) MB. The bar below shows the download progress."
+    for src in "${sources[@]}"; do
+        n=$(( n + 1 ))
+        label="${src%%|*}"; min="${src##*|}"; src="${src#*|}"; src="${src%|*}"
+
+        # Файл докачан до конца, но проверку не прошёл — он испорчен, начинаем с нуля
+        have=$(stat -c %s "$out" 2>/dev/null || echo 0)
+        if (( have > 0 )) && { [[ -z "$sha" ]] || (( size > 0 && have >= size )); }; then rm -f "$out"; have=0; fi
+
+        if (( have > 0 )); then
+            msg_inf "Источник ${n}/${#sources[@]}: ${label} — продолжаю с $(( have / 1048576 )) МБ" \
+                    "Source ${n}/${#sources[@]}: ${label} — resuming from $(( have / 1048576 )) MB"
+        else
+            msg_inf "Источник ${n}/${#sources[@]}: ${label}" "Source ${n}/${#sources[@]}: ${label}"
+        fi
+
+        fetch_progress "$src" "$out" "$min"
+        if xui_archive_ok "$out" "$sha"; then
+            msg_ok "Архив 3x-ui скачан${sha:+, контрольная сумма совпала}." \
+                   "The 3x-ui archive is downloaded${sha:+, checksum verified}."
+            return 0
+        fi
+
+        have=$(stat -c %s "$out" 2>/dev/null || echo 0)
+        if (( size > 0 && have >= size )); then
+            msg_wrn "${label}: файл скачан, но контрольная сумма НЕ совпала — он отброшен." \
+                    "${label}: the file was downloaded but the checksum does NOT match — it was discarded."
+            rm -f "$out"
+        else
+            msg_wrn "${label}: слишком медленно или обрыв — пробую следующий источник." \
+                    "${label}: too slow or interrupted — trying the next source."
+        fi
+    done
+    rm -f "$out"
+    return 1
+}
+
 install_panel() {
     local arch tag url
     arch=$(_arch)
@@ -2214,7 +2329,8 @@ install_panel() {
 
     msg_inf "Установка 3x-ui ${tag} (${arch})..." "Installing 3x-ui ${tag} (${arch})..."
     url="https://github.com/MHSanaei/3x-ui/releases/download/${tag}/x-ui-linux-${arch}.tar.gz"
-    wget -q --show-progress -O /tmp/x-ui.tar.gz "$url" || die "Не удалось скачать $url" "Failed to download $url"
+    download_xui "$tag" "$arch" /tmp/x-ui.tar.gz \
+        || die "Не удалось скачать 3x-ui ни с GitHub, ни с зеркал: $url" "Failed to download 3x-ui from GitHub or the mirrors: $url"
     tar -xzf /tmp/x-ui.tar.gz -C /usr/local/ || die "Ошибка распаковки архива" "Archive extraction failed"
     rm -f /tmp/x-ui.tar.gz
 
@@ -2294,9 +2410,124 @@ EOF
 
 restart_xui() {
     systemctl restart x-ui || die "x-ui не запустился: journalctl -u x-ui -n 50" "x-ui did not start: journalctl -u x-ui -n 50"
-    sleep 2
+    # «active» в systemd появляется раньше, чем панель начинает принимать соединения.
+    # Ждём, пока она реально откроет свой порт (до 30 с), иначе Nginx первые секунды отвечает 502.
+    local i port="${PANEL_PORT:-}"
+    for i in $(seq 1 30); do
+        if systemctl is-active --quiet x-ui && { [[ -z "$port" ]] || port_is_listening "$port"; }; then break; fi
+        sleep 1
+    done
     systemctl is-active --quiet x-ui || die "x-ui не активен: journalctl -u x-ui -n 50" "x-ui is not active: journalctl -u x-ui -n 50"
     msg_ok "x-ui перезапущен." "x-ui restarted."
+}
+
+# ─── Проверка доступности (healthcheck) ──────────────────────────────────────
+# Проверяется вся цепочка, а не только «служба запущена»: сначала сама панель на 127.0.0.1,
+# затем тот же адрес через Nginx на 443 — так видно, на каком звене обрыв.
+# Запросы идут с самого сервера, поэтому фаервол хостинга и DNS у клиента проверяются отдельно.
+HC_CODE=""
+
+# http_code URL [аргументы curl] → код ответа; 000 — соединения нет
+http_code() {
+    local u="$1" c; shift
+    c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$@" "$u" 2>/dev/null)
+    echo "${c:-000}"
+}
+
+# wait_http URL СЕКУНДЫ ШАБЛОН_КОДОВ [аргументы curl] — ждёт нужный код ответа; последний код в HC_CODE
+wait_http() {
+    local url="$1" t="$2" re="$3" i; shift 3
+    for (( i = 0; i < t; i += 2 )); do
+        HC_CODE=$(http_code "$url" "$@")
+        [[ "$HC_CODE" =~ $re ]] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+hc_ok()   { echo -e "  \e[1;32m✔\e[0m $(L "$@")"; }
+hc_fail() { echo -e "  \e[1;31m✘\e[0m $(L "$@")"; }
+
+healthcheck() {
+    local bad=0 ok_re='^(200|30[1278])$' front=(-k --resolve "${MAIN_DOMAIN}:443:127.0.0.1") a ip
+    section "Проверка доступности" "Availability check"
+
+    # 1. Панель: сама по себе, затем через Nginx
+    if wait_http "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/" 60 "$ok_re"; then
+        hc_ok "Панель 3x-ui отвечает (127.0.0.1:${PANEL_PORT})" "The 3x-ui panel responds (127.0.0.1:${PANEL_PORT})"
+        if wait_http "https://${MAIN_DOMAIN}/${PANEL_PATH}/" 20 "$ok_re" "${front[@]}"; then
+            hc_ok "Панель открывается через Nginx: https://${MAIN_DOMAIN}/${PANEL_PATH}/" \
+                  "The panel opens through Nginx: https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+        else
+            bad=1
+            hc_fail "Панель работает, но через Nginx не открывается (код ${HC_CODE})" \
+                    "The panel works but does not open through Nginx (code ${HC_CODE})"
+            case "$HC_CODE" in
+                000) say "      Nginx не принимает соединения на 443: systemctl status nginx" \
+                         "      Nginx does not accept connections on 443: systemctl status nginx" ;;
+                404) say "      В конфиге Nginx нет адреса панели — пересоберите его: Настройки → Сменить секретные пути" \
+                         "      The panel path is missing in the Nginx config — rebuild it: Settings → Change secret paths" ;;
+                *)   say "      Подробности: tail -n 20 /var/log/nginx/error.log" "      Details: tail -n 20 /var/log/nginx/error.log" ;;
+            esac
+        fi
+    else
+        bad=1
+        hc_fail "Панель 3x-ui не отвечает на 127.0.0.1:${PANEL_PORT} (код ${HC_CODE})" \
+                "The 3x-ui panel does not respond on 127.0.0.1:${PANEL_PORT} (code ${HC_CODE})"
+        say "      Причина — в журнале панели:" "      The reason is in the panel log:"
+        journalctl -u x-ui -n 8 --no-pager 2>/dev/null | sed 's/^/      /'
+    fi
+
+    # 2. Дашборд Fail2ban
+    if [[ -n "$F2B_PATH" ]]; then
+        if wait_http "https://${MAIN_DOMAIN}/${F2B_PATH}/" 20 '^200$' "${front[@]}"; then
+            hc_ok "Дашборд Fail2ban открывается: https://${MAIN_DOMAIN}/${F2B_PATH}/" \
+                  "The Fail2ban dashboard opens: https://${MAIN_DOMAIN}/${F2B_PATH}/"
+        else
+            bad=1
+            hc_fail "Дашборд Fail2ban не открывается (код ${HC_CODE})" "The Fail2ban dashboard does not open (code ${HC_CODE})"
+            if [[ "$(http_code "http://127.0.0.1:${DASH_PORT}/")" == 200 ]]; then
+                say "      Сам дашборд работает — дело в Nginx: tail -n 20 /var/log/nginx/error.log" \
+                    "      The dashboard itself works — the problem is in Nginx: tail -n 20 /var/log/nginx/error.log"
+            else
+                say "      Внутренний сервер дашборда не отвечает: nginx -t; ls ${DASH_NGINX_CONF}" \
+                    "      The dashboard's internal server does not respond: nginx -t; ls ${DASH_NGINX_CONF}"
+            fi
+        fi
+    fi
+
+    # 3. Подписка: без id клиента она отвечает ошибкой 4xx — важно, что отвечает вообще
+    if wait_http "https://${MAIN_DOMAIN}/${SUB_PATH}/" 10 '^[234][0-9][0-9]$' "${front[@]}"; then
+        hc_ok "Сервис подписки отвечает" "The subscription service responds"
+    else
+        bad=1
+        hc_fail "Сервис подписки не отвечает (код ${HC_CODE})" "The subscription service does not respond (code ${HC_CODE})"
+    fi
+
+    # 4. То, что с сервера проверить нельзя, но что чаще всего и мешает открыть ссылку снаружи
+    a=$(getent ahostsv4 "$MAIN_DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
+    if [[ -z "$a" ]]; then
+        bad=1; hc_fail "Домен ${MAIN_DOMAIN} не резолвится — ссылки снаружи не откроются" \
+                       "Domain ${MAIN_DOMAIN} does not resolve — the links will not open from outside"
+    elif ! server_ips | grep -qxF "$a"; then
+        say "  \e[1;33m!\e[0m ${MAIN_DOMAIN} указывает на ${a}, а не на адрес этого сервера (за NAT это нормально)" \
+            "  \e[1;33m!\e[0m ${MAIN_DOMAIN} points to ${a}, not to this server's address (normal behind NAT)"
+    fi
+    if [[ $GEOIP_ENABLED == y ]]; then
+        ip=$(admin_ip)
+        if [[ -n "$ip" ]] && ! whitelist_list | grep -qxF "$ip"; then
+            say "  \e[1;33m!\e[0m GeoIP включён, а вашего IP (${ip}) нет в whitelist: панель и дашборд откроются только из ${GEOIP_ALLOW_COUNTRY}" \
+                "  \e[1;33m!\e[0m GeoIP is on and your IP (${ip}) is not whitelisted: the panel and dashboard open only from ${GEOIP_ALLOW_COUNTRY}"
+        fi
+    fi
+
+    if (( bad )); then
+        msg_wrn "Часть проверок не пройдена — ссылки выше могут не открыться, пока причина не устранена." \
+                "Some checks failed — the links above may not open until the cause is fixed."
+        return 1
+    fi
+    msg_ok "Все адреса отвечают. Если ссылка не открывается у вас в браузере — проверьте фаервол хостинга (порт 443) и DNS." \
+           "All endpoints respond. If a link does not open in your browser, check the hosting firewall (port 443) and DNS."
 }
 
 show_results() {
@@ -2345,7 +2576,8 @@ action_install() {
 
     if [[ -f "$XUIDB" || -d "$XUI_DIR" ]]; then
         msg_wrn "Обнаружена существующая установка 3x-ui." "An existing 3x-ui installation was detected."
-        confirml "УДАЛИТЬ её вместе с базой (все подключения и клиенты будут потеряны) и поставить заново?" "DELETE it together with the database (all connections and clients will be lost) and install again?" n || return
+        confirm_danger "Она будет УДАЛЕНА вместе с базой: все подключения и клиенты пропадут, затем начнётся установка с нуля." \
+                       "It will be DELETED together with the database: all connections and clients are lost, then a clean install starts." || return
         # Останавливаем сразу, чтобы порты старых подключений можно было выбрать снова
         systemctl stop x-ui 2>/dev/null || true
     fi
@@ -2407,7 +2639,16 @@ action_install() {
     [[ -n "$F2B_PATH" ]] && dash_selftest
     tune_system
     restart_xui
+
+    # Ссылки выдаём только после того, как убедились, что по ним действительно отвечают
+    local hc_failed=0
+    healthcheck || hc_failed=1
+    echo
     show_results
+    if (( hc_failed )); then
+        msg_wrn "Установка завершена, но проверка доступности нашла проблемы (см. выше). Повторить проверку: меню → Статус служб." \
+                "Installation finished, but the availability check found problems (see above). To re-run it: menu → Service status."
+    fi
     DASH_PASS=""
 }
 
@@ -2436,6 +2677,94 @@ action_add() {
     apply_nginx
     restart_xui
     msg_ok "Готово. Добавьте клиентов в панели: https://${MAIN_DOMAIN}/${PANEL_PATH}/" "Done. Add clients in the panel: https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+}
+
+###############################################################################
+# УДАЛИТЬ ПОДКЛЮЧЕНИЕ
+###############################################################################
+# Сначала удаление идёт через штатный API панели: она сама чистит все связанные таблицы
+# и конфигурацию Xray, как бы ни была устроена база в её версии. Прямое удаление из базы —
+# запасной путь на случай, если API недоступен.
+action_delete() {
+    require_install || return
+
+    local total id row remark port proto listen clients=0 bak
+    total=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds;" 2>/dev/null)
+    if [[ ! "$total" =~ ^[1-9][0-9]*$ ]]; then
+        msg_inf "Подключений нет — удалять нечего." "There are no connections — nothing to delete."
+        return
+    fi
+
+    say "Подключения:" "Connections:"; list_inbounds; echo
+    while true; do
+        askl id "ID подключения для удаления (Enter — отмена)" "ID of the connection to delete (Enter — cancel)"
+        [[ -z "$id" ]] && { msg_inf "Отменено." "Cancelled."; return; }
+        if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+            msg_wrn "ID — это число из первой колонки списка." "The ID is the number from the first column of the list."; continue
+        fi
+        row=$(all_inbounds_json | jq -c --argjson id "$id" '.[] | select(.id == $id)')
+        [[ -n "$row" ]] && break
+        msg_wrn "Подключения #${id} нет в списке." "There is no connection #${id} in the list."
+    done
+    remark=$(jq -r '.remark' <<<"$row"); port=$(jq -r '.port' <<<"$row")
+    proto=$(jq -r '.protocol' <<<"$row"); listen=$(jq -r '.listen' <<<"$row")
+
+    # Сколько клиентов привязано: в новых версиях панели — отдельная таблица, в старых — список в настройках
+    if has_table client_inbounds; then
+        clients=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM client_inbounds WHERE inbound_id=${id};" 2>/dev/null)
+    else
+        clients=$(sqlite3 "$XUIDB" "SELECT settings FROM inbounds WHERE id=${id};" 2>/dev/null | jq '(.clients // []) | length' 2>/dev/null)
+    fi
+    [[ "$clients" =~ ^[0-9]+$ ]] || clients=0
+
+    echo
+    say "  Будет удалено: #${id} «${remark}» — ${proto}, ${listen:-*}:${port}, клиентов: ${clients}" \
+        "  To be deleted: #${id} «${remark}» — ${proto}, ${listen:-*}:${port}, clients: ${clients}"
+    (( total == 1 )) && say "  Это последнее подключение: после удаления VPN работать не будет." \
+                            "  This is the last connection: VPN will not work after it is deleted."
+    confirm_danger "Подключение #${id} будет удалено без возможности восстановления; у его клиентов этот сервер пропадёт." \
+                   "Connection #${id} will be deleted permanently; this server will disappear for its clients." || return
+
+    bak="/root/x-ui.db.bak.$(date +%s)"
+    cp -a "$XUIDB" "$bak" && msg_inf "Копия базы на случай ошибки: ${bak}" "Database copy in case of a mistake: ${bak}"
+
+    if api_call POST "inbounds/del/${id}" && api_ok; then
+        msg_ok "Панель удалила подключение #${id}." "The panel deleted connection #${id}."
+    else
+        msg_wrn "API панели недоступен — удаляю подключение напрямую из базы." \
+                "The panel API is unavailable — deleting the connection directly from the database."
+        systemctl stop x-ui 2>/dev/null      # иначе работающая панель может записать свои данные поверх
+        local sql="BEGIN;"
+        if has_table client_inbounds; then
+            # Новая схема: клиент может быть привязан к нескольким подключениям. Убираем привязку,
+            # а статистику трафика — только у тех, кто после этого не остался ни на одном подключении.
+            sql+="DELETE FROM client_inbounds WHERE inbound_id=${id};"
+            sql+="DELETE FROM client_traffics WHERE inbound_id=${id} AND email NOT IN
+                  (SELECT c.email FROM clients c JOIN client_inbounds ci ON ci.client_id = c.id);"
+        else
+            sql+="DELETE FROM client_traffics WHERE inbound_id=${id};"
+        fi
+        has_table inbound_fallbacks && sql+="DELETE FROM inbound_fallbacks WHERE master_id=${id} OR child_id=${id};"
+        sql+="DELETE FROM inbounds WHERE id=${id}; COMMIT;"
+        if ! sqlite3 "$XUIDB" "$sql"; then
+            cp -af "$bak" "$XUIDB"
+            systemctl start x-ui 2>/dev/null
+            msg_wrn "Не удалось удалить подключение — база возвращена в прежнее состояние." \
+                    "Failed to delete the connection — the database was restored."
+            return
+        fi
+        msg_ok "Подключение #${id} удалено из базы." "Connection #${id} was deleted from the database."
+    fi
+
+    # Внешний адрес подключения (таблица есть не во всех версиях панели)
+    has_table hosts && sqlite3 "$XUIDB" "DELETE FROM hosts WHERE inbound_id=${id};" 2>/dev/null
+
+    apply_nginx
+    restart_xui
+    msg_ok "Готово: «${remark}» удалено, Nginx пересобран, 3x-ui перезапущена." \
+           "Done: «${remark}» deleted, Nginx rebuilt, 3x-ui restarted."
+    say "  Сертификат его домена остался на сервере и никому не мешает; клиенты увидят изменение после обновления подписки." \
+        "  The certificate of its domain stays on the server and is harmless; clients see the change after the subscription refreshes."
 }
 
 ###############################################################################
@@ -2506,7 +2835,8 @@ action_modify() {
 action_uninstall() {
     msg_wrn "Будут удалены: 3x-ui с базой (все подключения и клиенты), nginx со всеми конфигами," "Will be removed: 3x-ui with its database (all connections and clients), nginx with all configs,"
     msg_wrn "сайт-заглушка, Fail2ban с дашбордом и GeoIP-защита." "the decoy site, Fail2ban with the dashboard and GeoIP protection."
-    confirml "Продолжить удаление?" "Continue the removal?" n || return
+    confirm_danger "Удаление необратимо: восстановить клиентов и настройки будет нельзя." \
+                   "The removal cannot be undone: clients and settings cannot be restored." || return
 
     systemctl stop x-ui 2>/dev/null || true
     systemctl disable x-ui 2>/dev/null || true
@@ -2810,34 +3140,41 @@ action_settings() {
     while true; do
         section "Настройки сервера" "Server settings"
         if [[ $INSTALLED == y ]]; then
+            say "  ── Подключения ──" "  ── Connections ──"
             say "  [1] Добавить подключение (inbound)" "  [1] Add a connection (inbound)"
             say "  [2] Изменить подключение (протокол / транспорт)" "  [2] Change a connection (protocol / transport)"
-            say "  [3] Сменить сайт-заглушку (другой случайный шаблон)" "  [3] Change the decoy site (another random template)"
-            say "  [4] Сменить секретные пути (панель, дашборд, подписка)" "  [4] Change secret paths (panel, dashboard, subscription)"
+            say "  [3] Удалить подключение" "  [3] Delete a connection"
+            say "  ── Сервер ──" "  ── Server ──"
+            say "  [4] Сменить сайт-заглушку (другой случайный шаблон)" "  [4] Change the decoy site (another random template)"
+            say "  [5] Сменить секретные пути (панель, дашборд, подписка)" "  [5] Change secret paths (panel, dashboard, subscription)"
         fi
-        say "  [5] Fail2ban и дашборд" "  [5] Fail2ban and the dashboard"
-        say "  [6] GeoIP и whitelist" "  [6] GeoIP and whitelist"
-        echo "  [7] Язык / Language"
-        [[ $INSTALLED == y ]] && say "  [8] Переустановить 3x-ui с нуля (база будет удалена)" "  [8] Reinstall 3x-ui from scratch (the database will be deleted)"
-        say "  \e[1;31m[9]\e[0m Полное удаление всего" "  \e[1;31m[9]\e[0m Full removal of everything"
+        say "  [6] Fail2ban и дашборд" "  [6] Fail2ban and the dashboard"
+        say "  [7] GeoIP и whitelist" "  [7] GeoIP and whitelist"
+        echo "  [8] Язык / Language"
+        say "  ── Опасная зона ──" "  ── Danger zone ──"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[9]\e[0m  Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[9]\e[0m  Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[10]\e[0m Полное удаление всего" "  \e[1;31m[10]\e[0m Full removal of everything"
         say "  [0] Назад" "  [0] Back"
-        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
-        if [[ $INSTALLED == n && "$c" =~ ^[12348]$ ]]; then
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+        c="${c//[[:space:]]/}"
+        if [[ $INSTALLED == n && "$c" =~ ^[123459]$ ]]; then
             msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
             continue
         fi
         case "$c" in
-            1) action_add;    pause ;;
-            2) action_modify; pause ;;
-            3) install_fake_site; pause ;;
-            4) action_paths ;;
-            5) action_f2b ;;
-            6) action_geoip ;;
-            7) choose_lang ;;
-            8) action_install; pause; return ;;
-            9) action_uninstall; pause; return ;;
-            0) return ;;
-            *) msg_wrn "Нет такого пункта." "No such item." ;;
+            1)  action_add;    pause ;;
+            2)  action_modify; pause ;;
+            3)  action_delete; pause ;;
+            4)  install_fake_site; pause ;;
+            5)  action_paths ;;
+            6)  action_f2b ;;
+            7)  action_geoip ;;
+            8)  choose_lang ;;
+            9)  action_install; pause; return ;;
+            10) action_uninstall; pause; return ;;
+            0)  return ;;
+            "") ;;                                  # пустой Enter — просто показать меню снова
+            *)  msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;
         esac
     done
 }
@@ -2890,6 +3227,11 @@ action_status() {
         for j in $(fail2ban-client status 2>/dev/null | sed -nE 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' ' '); do
             echo "  ${j}: $(fail2ban-client status "$j" 2>/dev/null | sed -nE 's/.*Currently banned:[[:space:]]*//p')"
         done
+    fi
+
+    # Отвечают ли на самом деле панель, дашборд и подписка
+    if [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && load_state 2>/dev/null; then
+        healthcheck || true
     fi
 }
 
@@ -2978,12 +3320,6 @@ box_line() {      # $1 — текст (по центру), $2 — ANSI-стил�
     printf '\e[1;36m║\e[0m%*s\e[%sm%s\e[0m%*s\e[1;36m║\e[0m\n' "$l" '' "${2:-0}" "$t" "$r" ''
 }
 
-box_right() {     # $1 — текст (прижат к правому краю), $2 — ANSI-стиль текста
-    local t="$1" l
-    l=$(( BOX_W - ${#t} - 2 ))
-    printf '\e[1;36m║\e[0m%*s\e[%sm%s\e[0m  \e[1;36m║\e[0m\n' "$l" '' "${2:-0}" "$t"
-}
-
 show_menu() {
     local status
     if systemctl is-active --quiet x-ui 2>/dev/null; then
@@ -2999,7 +3335,7 @@ show_menu() {
     box_line ""
     box_line "xpro v${XPRO_VERSION} — Secure VPN Deploy" "1;37"
     box_line "3x-ui · Nginx SNI · Reality · Fail2ban · GeoIP · 443" "0;36"
-    box_right "by sheijuro" "2;37"
+    box_line ""
     box_border "╚" "╝"
     # Сообщение об установке команды xpro показываем один раз (clear стирает вывод до меню)
     if [[ -n "$XPRO_NOTE" ]]; then
@@ -3155,19 +3491,37 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" choice
+        # Ввод закрыт (обрыв SSH, Ctrl+D) — выходим, а не крутим меню вхолостую
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" choice || { echo; exit 0; }
+        choice="${choice//[[:space:]]/}"
         echo
         case "$choice" in
             1) if [[ $INSTALLED == y ]]; then action_access; else action_install; fi; pause ;;
-            2) if [[ $INSTALLED == y ]]; then action_users; else msg_wrn "Нет такого пункта." "No such item."; sleep 1; fi ;;
+            2) if [[ $INSTALLED == y ]]; then action_users; else msg_wrn "Этот пункт появится после установки 3x-ui (пункт [1])." "This item appears after 3x-ui is installed (item [1])."; sleep 2; fi ;;
             3) action_settings ;;
             4) action_status;    pause ;;
             5) action_updates ;;
-            0) exit 0 ;;
-            *) msg_wrn "Нет такого пункта." "No such item."; sleep 1 ;;
+            0|q|Q) exit 0 ;;
+            "") ;;                                  # пустой Enter — просто показать меню снова
+            *) msg_wrn "Нет пункта «${choice}». Введите номер из списка." "There is no item «${choice}». Enter a number from the list."; sleep 2 ;;
         esac
     done
 }
+
+# ─── Защита от неправильного запуска ─────────────────────────────────────────
+# Меню интерактивное: без терминала (curl ... | bash, cron) оно читало бы пустой ввод бесконечно.
+if [[ ! -t 0 ]]; then
+    echo "xpro: нужен интерактивный терминал. Скачайте скрипт в файл и запустите: sudo bash xpro.sh"
+    echo "xpro: an interactive terminal is required. Save the script to a file and run: sudo bash xpro.sh"
+    exit 1
+fi
+# Два одновременных запуска (например, из двух окон SSH) испортили бы базу и конфиги друг другу
+exec 8>/run/xpro.lock
+if ! flock -n 8; then
+    echo "xpro уже запущен в другом окне. Закройте его и повторите."
+    echo "xpro is already running in another session. Close it and try again."
+    exit 1
+fi
 
 load_lang || choose_lang       # язык спрашивается один раз, при первом запуске
 install_xpro
