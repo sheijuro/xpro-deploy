@@ -58,19 +58,8 @@ WHITELIST_FILE="${STATE_DIR}/whitelist.txt"
 F2B_PATH=""              # секретный путь дашборда (пусто = дашборд не установлен)
 GEOIP_ENABLED="n"
 
-# Сайты-заглушки: открытые (MIT) шаблоны Start Bootstrap, в каждом архиве есть готовая папка dist/
-FAKE_SITES=(
-    "https://github.com/StartBootstrap/startbootstrap-clean-blog/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-freelancer/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-agency/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-creative/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-grayscale/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-resume/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-landing-page/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-stylish-portfolio/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-new-age/archive/refs/heads/master.tar.gz"
-    "https://github.com/StartBootstrap/startbootstrap-one-page-wonder/archive/refs/heads/master.tar.gz"
-)
+# Сайты-заглушки встроены в скрипт (см. site_template): из интернета ничего не скачивается
+SITE_COUNT=10
 
 # ─── Вывод ───────────────────────────────────────────────────────────────────
 # Язык интерфейса: ru | en. Выбор сохраняется в файле и переживает переустановку.
@@ -920,55 +909,221 @@ EOF
 }
 
 # ─── Сайт-заглушка ───────────────────────────────────────────────────────────
-write_fallback_site() {
-    cat > /var/www/html/index.html <<'EOF'
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Welcome</title>
-<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:15vh auto;padding:0 1rem;color:#333}
-h1{font-weight:600}p{line-height:1.6;color:#666}</style></head>
-<body><h1>It works</h1><p>This site is under construction. Please check back later.</p></body></html>
-EOF
+# Десять встроенных страниц. Они лежат прямо в скрипте, поэтому заглушка ставится мгновенно
+# и не зависит от доступности GitHub. __BRAND__ заменяется случайным названием сайта.
+site_name() {
+    case "$1" in
+        1) echo "404 Not Found" ;;            2) echo "Under Construction" ;;
+        3) echo "Blog" ;;                     4) echo "Index of /" ;;
+        5) echo "403 Access Denied" ;;        6) echo "Coming Soon" ;;
+        7) echo "Maintenance" ;;              8) echo "Personal page" ;;
+        9) echo "Server default page" ;;     10) echo "Service status" ;;
+    esac
 }
 
-# Случайный готовый шаблон (блог, портфолио, лендинг) → /var/www/html
-install_fake_site() {
-    local url tmp src site_name prev="" tries=0
-    # Какой шаблон стоит сейчас — чтобы при смене заглушки не выпал тот же самый.
-    # Отметка лежит вне папки сайта, иначе её можно было бы скачать по ссылке.
-    [[ -f "${STATE_DIR}/site" ]] && prev=$(cat "${STATE_DIR}/site" 2>/dev/null)
-    while true; do
-        url="${FAKE_SITES[RANDOM % ${#FAKE_SITES[@]}]}"
-        site_name=$(basename "$(dirname "$(dirname "$(dirname "$(dirname "$url")")")")")
-        tries=$((tries + 1))
-        [[ "$site_name" != "$prev" || $tries -ge 10 ]] && break
-    done
-    tmp=$(mktemp -d)
-    mkdir -p /var/www/html
-    rm -rf /var/www/html/*
+site_template() {
+    case "$1" in
+1) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>404 Not Found</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f6f7f9;color:#1f2933;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{text-align:center;padding:2rem}h1{font-size:6rem;margin:0;font-weight:700;letter-spacing:-.04em;color:#3b82f6}
+p{margin:.5rem 0;color:#52606d;font-size:1.1rem}small{color:#9aa5b1}</style></head>
+<body><main><h1>404</h1><p>The page you are looking for could not be found.</p><small>__BRAND__</small></main></body></html>
+EOF
+;;
+2) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — Under Construction</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fffbea;color:#3a3226;font-family:Georgia,"Times New Roman",serif}
+main{max-width:34rem;padding:2rem;text-align:center}.bar{height:14px;margin:0 auto 2rem;border-radius:7px;
+background:repeating-linear-gradient(45deg,#f5b700 0 16px,#222 16px 32px)}h1{font-size:2.2rem;margin:0 0 .6rem}p{line-height:1.7;color:#6b5d4d}</style></head>
+<body><main><div class="bar"></div><h1>Under Construction</h1><p>We are rebuilding this website from the ground up. Please check back soon.</p><p>&mdash; __BRAND__</p></main></body></html>
+EOF
+;;
+3) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — Notes</title>
+<style>body{margin:0;background:#fff;color:#222;font-family:Georgia,serif;line-height:1.7}header{border-bottom:1px solid #eee;padding:2.5rem 1rem;text-align:center}
+header h1{margin:0;font-size:2rem}header p{margin:.3rem 0 0;color:#888;font-family:system-ui,sans-serif;font-size:.95rem}
+main{max-width:40rem;margin:0 auto;padding:1rem}article{padding:1.6rem 0;border-bottom:1px solid #f0f0f0}
+article h2{margin:0 0 .2rem;font-size:1.35rem}time{color:#999;font-family:system-ui,sans-serif;font-size:.85rem}
+footer{text-align:center;color:#aaa;padding:2rem;font-family:system-ui,sans-serif;font-size:.85rem}</style></head>
+<body><header><h1>__BRAND__</h1><p>Notes on work, tools and small experiments</p></header><main>
+<article><h2>Keeping things simple</h2><time>March 14</time><p>Most projects do not fail because of a missing feature. They fail because nobody could explain what the thing was for.</p></article>
+<article><h2>A week without notifications</h2><time>February 2</time><p>I turned everything off for seven days. The first two were uncomfortable, the rest were quietly productive.</p></article>
+<article><h2>Notes from a slow winter</h2><time>January 9</time><p>Short days are good for long reading lists. A few books that were worth the time.</p></article>
+</main><footer>&copy; __BRAND__</footer></body></html>
+EOF
+;;
+4) cat <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><title>Index of /</title>
+<style>body{font-family:monospace;margin:1.5rem;color:#000;background:#fff}h1{font-size:1.4rem;font-weight:bold;margin:0 0 .6rem}
+hr{border:0;border-top:1px solid #999}pre{margin:.4rem 0;line-height:1.5}a{color:#00e}</style></head>
+<body><h1>Index of /</h1><hr><pre><a href="../">../</a>
+</pre><hr></body></html>
+EOF
+;;
+5) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>403 Forbidden</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#111827;color:#e5e7eb;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:30rem;padding:2rem;text-align:center}.lock{width:64px;height:64px;margin:0 auto 1.2rem;border:3px solid #ef4444;border-radius:50%;
+display:grid;place-items:center;color:#ef4444;font-size:1.8rem;font-weight:700}h1{margin:0 0 .5rem;font-size:1.8rem}p{color:#9ca3af;line-height:1.6}code{color:#fca5a5}</style></head>
+<body><main><div class="lock">!</div><h1>Access Denied</h1><p>You do not have permission to view this resource.</p><p><code>Error 403</code> &middot; __BRAND__</p></main></body></html>
+EOF
+;;
+6) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — Coming Soon</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;color:#fff;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+background:linear-gradient(135deg,#1e3a8a,#7c3aed 55%,#db2777)}main{text-align:center;padding:2rem}
+h1{font-size:3rem;margin:0;letter-spacing:-.02em}p{font-size:1.15rem;opacity:.85;margin:.8rem 0 0}.tag{display:inline-block;margin-bottom:1.2rem;
+padding:.3rem .9rem;border:1px solid rgba(255,255,255,.5);border-radius:999px;font-size:.8rem;letter-spacing:.12em;text-transform:uppercase}</style></head>
+<body><main><span class="tag">Coming soon</span><h1>__BRAND__</h1><p>Something new is on the way. Stay tuned.</p></main></body></html>
+EOF
+;;
+7) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scheduled maintenance</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f1f5f9;color:#0f172a;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:32rem;margin:1rem;padding:2.2rem;background:#fff;border-radius:14px;box-shadow:0 10px 30px rgba(15,23,42,.08)}
+h1{margin:0 0 .6rem;font-size:1.6rem}p{color:#475569;line-height:1.65;margin:.4rem 0}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#f59e0b;margin-right:.5rem}</style></head>
+<body><main><h1><span class="dot"></span>We&rsquo;ll be back shortly</h1><p>__BRAND__ is currently down for scheduled maintenance. We expect to be back online soon.</p><p>Thank you for your patience.</p></main></body></html>
+EOF
+;;
+8) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fafaf9;color:#1c1917;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:30rem;padding:2rem}.av{width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,#0ea5e9,#22c55e);margin-bottom:1.2rem}
+h1{margin:0;font-size:1.9rem}h2{margin:.2rem 0 1rem;font-size:1rem;font-weight:500;color:#78716c}p{line-height:1.7;color:#44403c}
+ul{list-style:none;padding:0;margin:1.2rem 0 0;display:flex;gap:1rem;color:#0ea5e9;font-size:.95rem}</style></head>
+<body><main><div class="av"></div><h1>__BRAND__</h1><h2>Design &amp; development studio</h2>
+<p>We build small, fast websites and internal tools for teams that value clarity over complexity.</p>
+<ul><li>Work</li><li>About</li><li>Contact</li></ul></main></body></html>
+EOF
+;;
+9) cat <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title>
+<style>body{width:35em;margin:0 auto;padding-top:3em;font-family:Tahoma,Verdana,Arial,sans-serif;color:#222}h1{font-weight:normal}p{line-height:1.5}</style></head>
+<body><h1>Welcome to this server</h1><p>If you see this page, the web server is successfully installed and working. Further configuration is required.</p>
+<p><em>Thank you for using this server.</em></p></body></html>
+EOF
+;;
+10) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ Status</title>
+<style>body{margin:0;background:#f8fafc;color:#0f172a;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:38rem;margin:0 auto;padding:3rem 1rem}
+h1{font-size:1.5rem;margin:0 0 1.5rem}.ok{background:#16a34a;color:#fff;padding:1rem 1.2rem;border-radius:10px;font-weight:600;margin-bottom:1.5rem}
+ul{list-style:none;margin:0;padding:0;background:#fff;border:1px solid #e2e8f0;border-radius:10px}li{display:flex;justify-content:space-between;padding:.9rem 1.2rem;border-bottom:1px solid #f1f5f9}
+li:last-child{border:0}li span{color:#16a34a;font-size:.9rem}footer{margin-top:1.5rem;color:#94a3b8;font-size:.85rem}</style></head>
+<body><main><h1>__BRAND__ Status</h1><div class="ok">All systems operational</div>
+<ul><li>Website <span>Operational</span></li><li>API <span>Operational</span></li><li>Dashboard <span>Operational</span></li><li>Notifications <span>Operational</span></li></ul>
+<footer>No incidents reported in the last 30 days.</footer></main></body></html>
+EOF
+;;
+    esac
+}
 
-    msg_inf "Сайт-заглушка: ${site_name}" "Decoy site: ${site_name}"
-    if wget -q --show-progress -T 30 -O "$tmp/site.tar.gz" "$url" && tar -xzf "$tmp/site.tar.gz" -C "$tmp"; then
-        src=$(find "$tmp" -maxdepth 2 -type d -name dist | head -1)
-        if [[ -n "$src" && -f "$src/index.html" ]]; then
-            cp -a "$src"/. /var/www/html/
-            # Убираем узнаваемую подпись шаблона: на каждом сервере — своё случайное название сайта
-            local brands=("Northwind Studio" "Aurora Labs" "Bluepeak" "Vertex Digital" "Lumen Works"
-                          "Nordic Cloud" "Stonebridge" "Pixelcraft" "Greyline Media" "Summit Systems"
-                          "Harbor & Co" "Silverpine" "Atlas Creative" "Echo Valley" "Brightwave")
-            local brand="${brands[RANDOM % ${#brands[@]}]}"
-            find /var/www/html -maxdepth 1 -name '*.html' -exec sed -i "s/Start Bootstrap/${brand}/g" {} +
-            mkdir -p "$STATE_DIR"
-            echo "$site_name" > "${STATE_DIR}/site"
-            msg_ok "Шаблон сайта установлен, название сайта: ${brand}" "Site template installed, site name: ${brand}"
+# Случайная встроенная заглушка → /var/www/html/index.html.
+# Уже выпадавшие номера записываются: пока не перебраны все десять, страницы на сервере не повторяются.
+install_fake_site() {
+    local used="${STATE_DIR}/site-used" pool=() n last="" brand
+    local brands=("Northwind Studio" "Aurora Labs" "Bluepeak" "Vertex Digital" "Lumen Works"
+                  "Nordic Cloud" "Stonebridge" "Pixelcraft" "Greyline Media" "Summit Systems"
+                  "Harbor and Co" "Silverpine" "Atlas Creative" "Echo Valley" "Brightwave")
+    mkdir -p "$STATE_DIR" /var/www/html
+    [[ -f "$used" ]] && last=$(tail -n 1 "$used" 2>/dev/null)
+
+    for n in $(seq 1 "$SITE_COUNT"); do
+        grep -qx "$n" "$used" 2>/dev/null || pool+=("$n")
+    done
+    if (( ${#pool[@]} == 0 )); then
+        # Все десять уже были — начинаем круг заново, но не с той, что стоит сейчас
+        : > "$used"
+        for n in $(seq 1 "$SITE_COUNT"); do [[ "$n" != "$last" ]] && pool+=("$n"); done
+    fi
+    n="${pool[RANDOM % ${#pool[@]}]}"
+    brand="${brands[RANDOM % ${#brands[@]}]}"
+
+    rm -rf /var/www/html/*
+    site_template "$n" | sed "s/__BRAND__/${brand}/g" > /var/www/html/index.html
+    if [[ ! -s /var/www/html/index.html ]]; then
+        msg_wrn "Не удалось записать страницу-заглушку." "Failed to write the decoy page."; return 1
+    fi
+    echo "$n" >> "$used"
+    echo "builtin-${n}" > "${STATE_DIR}/site"       # отметка лежит вне папки сайта: её нельзя скачать по ссылке
+    chown -R www-data:www-data /var/www/html 2>/dev/null || true
+    msg_ok "Сайт-заглушка: «$(site_name "$n")» (${n} из ${SITE_COUNT})" "Decoy site: «$(site_name "$n")» (${n} of ${SITE_COUNT})"
+}
+
+# Смена заглушки из меню: свой HTML случайной страницей без спроса не затираем
+action_site_random() {
+    if [[ "$(cat "${STATE_DIR}/site" 2>/dev/null)" == custom ]]; then
+        confirml "Сейчас стоит ваш собственный HTML. Заменить его случайной встроенной страницей?" \
+                 "Your own HTML is currently installed. Replace it with a random built-in page?" n || return
+    fi
+    install_fake_site
+}
+
+# Свой HTML для заглушки: редактор, вставка текста или готовый файл
+action_site_custom() {
+    local c tmp src dst=/var/www/html/index.html
+    section "Свой HTML для заглушки" "Custom HTML for the decoy site"
+    say "  [1] Открыть текущую страницу в редакторе nano" "  [1] Open the current page in the nano editor"
+    say "  [2] Вставить HTML-код текстом" "  [2] Paste HTML code as text"
+    say "  [3] Взять готовый файл с сервера" "  [3] Use a file that is already on the server"
+    say "  [0] Назад" "  [0] Back"
+    read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+    tmp=$(mktemp)
+    case "${c//[[:space:]]/}" in
+        1)  if ! command -v nano >/dev/null 2>&1; then
+                msg_inf "Установка редактора nano..." "Installing the nano editor..."
+                apt-get install -y nano >/dev/null 2>&1
+            fi
+            [[ -f "$dst" ]] && cp -f "$dst" "$tmp"
+            say "  Сохранение в nano: Ctrl+O, Enter. Выход: Ctrl+X." "  Save in nano: Ctrl+O, Enter. Exit: Ctrl+X."
+            sleep 2
+            if command -v nano >/dev/null 2>&1; then nano "$tmp"; else "${EDITOR:-vi}" "$tmp"; fi ;;
+        2)  say "  Вставьте HTML-код. Чтобы закончить, введите на отдельной строке слово END и нажмите Enter." \
+                "  Paste the HTML code. To finish, type the word END on a separate line and press Enter."
+            local line
+            while IFS= read -r line; do
+                [[ "$line" == END ]] && break
+                printf '%s\n' "$line" >> "$tmp"
+            done ;;
+        3)  askl src "Путь к HTML-файлу" "Path to the HTML file"
+            if [[ ! -f "$src" ]]; then
+                rm -f "$tmp"; msg_wrn "Файл не найден: ${src}" "File not found: ${src}"; return
+            fi
+            cp -f "$src" "$tmp" ;;
+        *)  rm -f "$tmp"; return ;;
+    esac
+
+    # Защита от пустой страницы и от случайной вставки не того текста
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"; msg_wrn "Страница пустая — заглушка не изменена." "The page is empty — the decoy site was not changed."; return
+    fi
+    if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+        rm -f "$tmp"; msg_inf "Изменений нет — заглушка осталась прежней." "No changes — the decoy site stays the same."; return
+    fi
+    if ! grep -qiE '<(!doctype|html|body|head)' "$tmp"; then
+        if ! confirml "В тексте не найдено HTML-тегов. Всё равно поставить его как страницу?" \
+                      "No HTML tags were found in the text. Install it as the page anyway?" n; then
+            rm -f "$tmp"; return
         fi
     fi
-    if [[ ! -f /var/www/html/index.html ]]; then
-        msg_wrn "Не удалось скачать шаблон — ставлю простую страницу." "Failed to download the template — installing a simple page."
-        write_fallback_site
-    fi
-    rm -rf "$tmp"
-    chown -R www-data:www-data /var/www/html 2>/dev/null || true
+
+    mkdir -p "$STATE_DIR" /var/www/html
+    [[ -f "$dst" ]] && cp -f "$dst" "${STATE_DIR}/site-prev.html"     # прежняя страница — на случай ошибки
+    install -m 644 "$tmp" "$dst"
+    rm -f "$tmp"
+    chown www-data:www-data "$dst" 2>/dev/null || true
+    echo "custom" > "${STATE_DIR}/site"
+    msg_ok "Своя страница установлена: https://${MAIN_DOMAIN:-домен}/" "Your page is installed: https://${MAIN_DOMAIN:-domain}/"
+    say "  Прежняя страница сохранена в ${STATE_DIR}/site-prev.html. Картинки и стили кладите рядом, в /var/www/html/." \
+        "  The previous page is saved in ${STATE_DIR}/site-prev.html. Put images and styles next to it, in /var/www/html/."
 }
 
 ###############################################################################
@@ -2935,8 +3090,10 @@ action_access() {
     section "Подключения (сейчас в базе панели)" "Connections (currently in the panel database)"
     list_inbounds
 
-    section "Клиенты и их ссылки-подписки" "Clients and their subscription links"
-    list_clients
+    # Список клиентов здесь не выводится: он читается из базы и показывается только
+    # в разделе «Управление пользователями», чтобы этот экран открывался мгновенно.
+    say "  Клиенты и их ссылки-подписки: главное меню → [2] Управление пользователями" \
+        "  Clients and their subscription links: main menu → [2] Manage users"
 
     # Пароли в базе хранятся только в виде хеша, поэтому показать можно лишь те,
     # что были записаны в файл сводки при установке и при смене пароля дашборда.
@@ -3082,12 +3239,13 @@ action_users() {
         say "  [1] Добавить клиента" "  [1] Add a client"
         say "  [2] Удалить клиента"  "  [2] Remove a client"
         say "  [0] Назад" "  [0] Back"
-        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c
-        case "$c" in
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+        case "${c//[[:space:]]/}" in
             1) user_add ;;
             2) user_del ;;
             0) return ;;
-            *) msg_wrn "Нет такого пункта." "No such item." ;;
+            "") ;;
+            *) msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;
         esac
     done
 }
@@ -3145,19 +3303,20 @@ action_settings() {
             say "  [2] Изменить подключение (протокол / транспорт)" "  [2] Change a connection (protocol / transport)"
             say "  [3] Удалить подключение" "  [3] Delete a connection"
             say "  ── Сервер ──" "  ── Server ──"
-            say "  [4] Сменить сайт-заглушку (другой случайный шаблон)" "  [4] Change the decoy site (another random template)"
-            say "  [5] Сменить секретные пути (панель, дашборд, подписка)" "  [5] Change secret paths (panel, dashboard, subscription)"
+            say "  [4] Сменить сайт-заглушку (другая встроенная страница)" "  [4] Change the decoy site (another built-in page)"
+            say "  [5] Установить свой HTML для заглушки" "  [5] Install your own HTML for the decoy site"
+            say "  [6] Сменить секретные пути (панель, дашборд, подписка)" "  [6] Change secret paths (panel, dashboard, subscription)"
         fi
-        say "  [6] Fail2ban и дашборд" "  [6] Fail2ban and the dashboard"
-        say "  [7] GeoIP и whitelist" "  [7] GeoIP and whitelist"
-        echo "  [8] Язык / Language"
+        say "  [7] Fail2ban и дашборд" "  [7] Fail2ban and the dashboard"
+        say "  [8] GeoIP и whitelist" "  [8] GeoIP and whitelist"
+        echo "  [9] Язык / Language"
         say "  ── Опасная зона ──" "  ── Danger zone ──"
-        [[ $INSTALLED == y ]] && say "  \e[1;31m[9]\e[0m  Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[9]\e[0m  Reinstall 3x-ui from scratch (the database will be deleted)"
-        say "  \e[1;31m[10]\e[0m Полное удаление всего" "  \e[1;31m[10]\e[0m Full removal of everything"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[10]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[10]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[11]\e[0m Полное удаление всего" "  \e[1;31m[11]\e[0m Full removal of everything"
         say "  [0] Назад" "  [0] Back"
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
-        if [[ $INSTALLED == n && "$c" =~ ^[123459]$ ]]; then
+        if [[ $INSTALLED == n && "$c" =~ ^([1-6]|10)$ ]]; then
             msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
             continue
         fi
@@ -3165,13 +3324,14 @@ action_settings() {
             1)  action_add;    pause ;;
             2)  action_modify; pause ;;
             3)  action_delete; pause ;;
-            4)  install_fake_site; pause ;;
-            5)  action_paths ;;
-            6)  action_f2b ;;
-            7)  action_geoip ;;
-            8)  choose_lang ;;
-            9)  action_install; pause; return ;;
-            10) action_uninstall; pause; return ;;
+            4)  action_site_random; pause ;;
+            5)  action_site_custom; pause ;;
+            6)  action_paths ;;
+            7)  action_f2b ;;
+            8)  action_geoip ;;
+            9)  choose_lang ;;
+            10) action_install; pause; return ;;
+            11) action_uninstall; pause; return ;;
             0)  return ;;
             "") ;;                                  # пустой Enter — просто показать меню снова
             *)  msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;
@@ -3525,5 +3685,6 @@ fi
 
 load_lang || choose_lang       # язык спрашивается один раз, при первом запуске
 install_xpro
-check_update                   # только проверка: о новой версии сообщит строка [9] в меню
+# Проверки обновлений при запуске нет: сетевой запрос задерживал появление меню.
+# Она выполняется по запросу — главное меню → «Обновить систему и скрипт».
 main_menu
