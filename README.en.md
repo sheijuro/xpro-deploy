@@ -8,8 +8,6 @@ An interactive bash script that installs and manages [3x-ui](https://github.com/
 
 All external traffic goes through a single port — 443. Nginx routes it by SNI and by path, while the panel, the subscription service and every connection listen on `127.0.0.1` only.
 
-
-
 ## ⚡ Installation
 
 ```bash
