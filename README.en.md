@@ -2,7 +2,7 @@
 
 [Русский](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-1.4.2-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
+![version](https://img.shields.io/badge/version-1.5.0-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
 
 An interactive bash script that installs and manages [3x-ui](https://github.com/MHSanaei/3x-ui) on Debian and Ubuntu.
 
@@ -26,19 +26,22 @@ The interface language (English or Russian) is chosen on the first run and can b
 
 ## ✨ Features
 
-- 🔒 **One port exposed.** Only SSH, 80 and 443 are open. Connection ports are unreachable from outside even with the firewall off.
+- 🔒 **One port exposed.** Only SSH, 443 and, if you choose so, 80 are open. Connection ports are unreachable from outside even with the firewall off.
 - 🧩 **Flexible connections.** VLESS and Trojan over TCP, gRPC or XHTTP with Reality; TCP with its own TLS certificate; VLESS, Trojan and Shadowsocks over WebSocket, gRPC or XHTTP with TLS on the main domain.
 - ➕ **As many connections as you need.** Add, change and delete them from the menu, no manual Nginx editing.
 - 🔗 **Panel and subscription without ports in the URL.** HTTPS only, behind a secret path: `https://domain/secret-path/`.
 - ✅ **Availability check.** After installation the script checks the panel, the dashboard and the subscription — directly and through Nginx — and shows what works and what does not.
 - 🚀 **Fast 3x-ui download.** When GitHub is slow, the script switches to mirrors and resumes from the same point. A file from a mirror is accepted only if its SHA-256 checksum matches the one published by GitHub.
 - 📜 **Let's Encrypt certificates** with automatic renewal.
-- 🎭 **Decoy website.** One of ten built-in pages with a random site name; nothing is downloaded from the internet. Can be changed from the menu, or replaced with your own HTML.
+- 🎭 **Decoy websites.** 25 built-in pages, nothing is downloaded from the internet. Every domain of the server gets its own page with its own name — two domains never look like the same site. Change them from the menu one by one or all at once, or install your own HTML.
 - 👥 **Client management from the terminal.** Add and remove clients without opening the web panel.
 - 🔄 **Safe updates.** The script, system packages and the panel are updated from the menu; your data is not touched.
 - 🛡️ **Fail2ban.** Protects SSH and the website; port 443 is never banned, so VPN clients are not affected. Installs with or without the web dashboard.
 - 📊 **Fail2ban dashboard.** Ban statistics in an OLED Black style behind a secret path, with no extra open port.
 - 🌍 **GeoIP protection and whitelist.** The panel and dashboard open only from the allowed country and from trusted addresses. VPN and subscriptions stay reachable from any country.
+- 🕵️ **Fallback to the website.** TCP+TLS connections (Vision included) serve the decoy site to outsiders instead of dropping the connection.
+- 🚪 **Port 80, your choice.** Keep it open with a redirect to HTTPS, or closed — then it is opened only while certificates are issued or renewed.
+- 🔏 **Encrypted DNS.** DNS over TLS for the system as a separate menu item, rolled back automatically if the host blocks it.
 - 🧯 **Mistake protection.** Irreversible actions require typing the word `yes`; a second simultaneous menu session is blocked.
 - 🏳️ **Flag names.** A flag emoji is added by country: `🇫🇮 Finland`.
 - 🌐 **Two languages.** English and Russian interface.
@@ -70,15 +73,17 @@ Before 3x-ui is installed, item 1 is "Install 3x-ui from scratch" and item 2 is 
 | 1 | Add a connection |
 | 2 | Change a connection (protocol or transport) |
 | 3 | Delete a connection |
-| 4 | Change the decoy site to another built-in page |
-| 5 | Install your own HTML for the decoy site |
+| 4 | Change the decoy site: for a chosen domain or for all at once |
+| 5 | Install your own HTML for the decoy site of a chosen domain |
 | 6 | Change secret paths (panel, dashboard, subscription) |
 | 7 | Change the 3x-ui panel login and password |
-| 8 | Fail2ban and the dashboard |
-| 9 | GeoIP and whitelist |
-| 10 | Язык / Language |
-| 11 | Reinstall 3x-ui from scratch |
-| 12 | Full removal of everything |
+| 8 | Port 80: keep it open or closed |
+| 9 | Fail2ban and the dashboard |
+| 10 | GeoIP and whitelist |
+| 11 | Encrypted DNS (DNS over TLS) |
+| 12 | Язык / Language |
+| 13 | Reinstall 3x-ui from scratch |
+| 14 | Full removal of everything |
 
 Updates do not touch your data: the 3x-ui database, Nginx and Fail2ban configs and certificates stay as they are. A new script version is checked on request under "Updates", not on every start.
 

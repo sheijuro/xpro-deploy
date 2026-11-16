@@ -34,7 +34,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.4.2"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.5.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -42,6 +42,15 @@ STATE_FILE="${STATE_DIR}/state.env"
 SUMMARY_FILE="/root/xpro-summary.txt"
 WWW_PORT=7443            # nginx https c proxy_protocol (приём из stream)
 TARGET_PORT=9443         # nginx https без proxy_protocol (Reality target)
+FB_H1_PORT=7080          # nginx http без TLS: fallback для подключений TCP+TLS (HTTP/1.1)
+FB_H2_PORT=7081          # то же для HTTP/2 без шифрования (h2c)
+
+# Порт 80: open — открыт всегда (редирект на HTTPS, как у обычного сайта);
+#          closed — закрыт, открывается только на время выпуска и продления сертификатов.
+PORT80_MODE="open"
+
+# Шифрованный DNS для самой системы (DNS over TLS через systemd-resolved)
+DOT_CONF="/etc/systemd/resolved.conf.d/xpro-dot.conf"
 PUBLISH_PANEL=y          # панель всегда публикуется через nginx по секретному пути
 FINGERPRINT="firefox"    # uTLS-отпечаток во всех Reality-настройках
 
@@ -67,7 +76,10 @@ F2B_PATH=""              # секретный путь дашборда (пус�
 GEOIP_ENABLED="n"
 
 # Сайты-заглушки встроены в скрипт (см. site_template): из интернета ничего не скачивается
-SITE_COUNT=10
+SITE_COUNT=25
+# У каждого домена своя заглушка: основной домен — в /var/www/html, остальные — в отдельных папках.
+SITES_ROOT="/var/www/xpro-sites"
+SITES_MAP="${STATE_DIR}/sites.map"      # строки вида «домен<TAB>номер страницы» (или custom)
 
 # ─── Вывод ───────────────────────────────────────────────────────────────────
 # Язык интерфейса: ru | en. Выбор сохраняется в файле и переживает переустановку.
@@ -82,7 +94,7 @@ say() { echo -e "$(L "$@")"; }
 
 # Все сообщения принимают два аргумента: русский текст и английский
 msg_ok()  { echo -e "\e[1;32m[OK]\e[0m $(L "$@")"; }
-msg_inf() { echo -e "\e[1;34m[..]\e[0m $(L "$@")"; }
+msg_inf() { echo -e "\e[38;5;245m[..]\e[0m $(L "$@")"; }
 msg_wrn() { echo -e "\e[1;33m[!!]\e[0m $(L "$@")"; }
 die()     { echo -e "\e[1;31m[$(L "ОШИБКА" "ERROR")]\e[0m $(L "$@")" >&2; exit 1; }
 
@@ -162,7 +174,7 @@ gen_random_string() { head -c 4096 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "
 gen_group_id()      { head -c 4096 /dev/urandom | tr -dc 'a-z0-9'    | head -c 16; }
 
 # ─── Состояние установки (домены, пути, порты) ───────────────────────────────
-STATE_VARS=(MAIN_DOMAIN REALITY_DOMAIN PANEL_PORT PANEL_PATH SUB_PORT SUB_PATH JSON_PATH PROJECT_NAME F2B_PATH GEOIP_ENABLED)
+STATE_VARS=(MAIN_DOMAIN REALITY_DOMAIN PANEL_PORT PANEL_PATH SUB_PORT SUB_PATH JSON_PATH PROJECT_NAME F2B_PATH GEOIP_ENABLED PORT80_MODE)
 
 save_state() {
     local v
@@ -186,6 +198,7 @@ require_install() {
     fi
     detect_schema
     init_used
+    return 0
 }
 
 # ─── Чтение inbounds из базы ─────────────────────────────────────────────────
@@ -242,7 +255,7 @@ list_inbounds() {
 USED_PORTS=(); USED_SNI=()
 
 init_used() {
-    USED_PORTS=(22 80 443 "$WWW_PORT" "$TARGET_PORT" "$DASH_PORT")
+    USED_PORTS=(22 80 443 "$WWW_PORT" "$TARGET_PORT" "$DASH_PORT" "$FB_H1_PORT" "$FB_H2_PORT")
     USED_SNI=()
     [[ -n "${PANEL_PORT:-}" ]] && USED_PORTS+=("$PANEL_PORT")
     [[ -n "${SUB_PORT:-}"   ]] && USED_PORTS+=("$SUB_PORT")
@@ -252,6 +265,10 @@ init_used() {
         [[ -n "$port" ]] && USED_PORTS+=("$port")
         [[ "$kind" == reality && -n "$val" ]] && USED_SNI+=("$val")
     done < <(inbound_routes)
+    # Явный успех: без этой строки функция возвращала результат последней проверки в цикле.
+    # Если последним в базе шло подключение через nginx (не Reality), она «проваливалась»,
+    # и пункты меню «добавить / изменить / удалить подключение» молча ничего не делали.
+    return 0
 }
 
 # Здесь и ниже вместо "grep -q" стоит "grep ... >/dev/null": grep -q выходит на первом совпадении,
@@ -586,11 +603,43 @@ set_host() {              # INBOUND_ID SEC SNI
                    "Failed to write the host for inbound #${id} — set the external address ${addr}:443 in the panel manually."
 }
 
+# ─── Fallback для подключений с собственным TLS (TCP + TLS, в том числе Vision) ───
+# Если на такое подключение приходит не клиент, а обычный браузер или сканер, Xray не обрывает
+# соединение, а отдаёт его nginx: тот показывает сайт-заглушку. Снаружи сервер неотличим от сайта.
+# Старые версии 3x-ui хранят список fallback в настройках подключения, новые — в отдельной
+# таблице inbound_fallbacks. Записываем в оба места: лишняя запись ни одной версии не мешает.
+
+# settings_with_fallbacks SETTINGS SEC OLD_SEC → settings с нужным списком fallback
+settings_with_fallbacks() {
+    if [[ "$2" == tls ]]; then
+        jq -c --arg h2 "127.0.0.1:${FB_H2_PORT}" --arg h1 "127.0.0.1:${FB_H1_PORT}" \
+            '.fallbacks = [{alpn:"h2", dest:$h2, xver:0}, {dest:$h1, xver:0}]' <<<"$1"
+    elif [[ "${3:-}" == tls ]]; then
+        # Подключение перестало быть TLS-подключением — наши fallback ему больше не нужны
+        jq -c 'if has("fallbacks") then .fallbacks = [] else . end' <<<"$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# set_fallback_rows INBOUND_ID SEC OLD_SEC — то же для таблицы inbound_fallbacks
+set_fallback_rows() {
+    has_table inbound_fallbacks || return 0
+    [[ "$2" == tls || "${3:-}" == tls ]] || return 0
+    sqlite3 "$XUIDB" "DELETE FROM inbound_fallbacks WHERE master_id=$1 AND dest IN ('127.0.0.1:${FB_H1_PORT}','127.0.0.1:${FB_H2_PORT}');" 2>/dev/null
+    [[ "$2" == tls ]] || return 0
+    sqlite3 "$XUIDB" "INSERT INTO inbound_fallbacks (master_id, child_id, name, alpn, path, dest, xver, sort_order)
+        VALUES ($1, 0, '', 'h2', '', '127.0.0.1:${FB_H2_PORT}', 0, 0),
+               ($1, 0, '', '',   '', '127.0.0.1:${FB_H1_PORT}', 0, 1);" 2>/dev/null \
+        || msg_wrn "Не удалось записать fallback в таблицу панели — задайте его в панели вручную: 127.0.0.1:${FB_H1_PORT}" \
+                   "Failed to write the fallback to the panel table — set it in the panel manually: 127.0.0.1:${FB_H1_PORT}"
+}
+
 # db_add_inbound REMARK PORT PROTO NET SEC SNI
 db_add_inbound() {
     local remark="$1" port="$2" proto="$3" net="$4" sec="$5" sni="$6"
     local settings sniffing tag id
-    settings=$(build_settings "$proto")
+    settings=$(settings_with_fallbacks "$(build_settings "$proto")" "$sec" "")
     build_stream "$net" "$sec" "$sni"
     add_external_proxy "$sec" "$sni"
     sniffing='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
@@ -606,6 +655,7 @@ db_add_inbound() {
 
     id=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE tag='${tag}';")
     set_host "$id" "$sec" "$sni"
+    set_fallback_rows "$id" "$sec" ""
     msg_ok "Подключение: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})" \
            "Connection: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})"
 }
@@ -647,20 +697,87 @@ collect_inbounds_loop() {
 # Сертификаты выпускаются в режиме standalone: на несколько секунд нужен свободный порт 80,
 # поэтому nginx останавливается (его запускает apply_nginx / вызывающий код).
 issue_cert() {
-    local d="$1"
+    local d="$1" opened=n rc
     [[ -f "/etc/letsencrypt/live/${d}/fullchain.pem" ]] && { msg_ok "Сертификат для $d уже есть." "A certificate for $d already exists."; return 0; }
-    systemctl stop nginx 2>/dev/null || true
-    fuser -k 80/tcp 2>/dev/null || true
+
+    # Порт 80 занят nginx (режим «открыт») — освобождаем его на время выпуска.
+    # В режиме «закрыт» nginx порт 80 не слушает, и останавливать его незачем: клиенты не отваливаются.
+    if port_is_listening 80; then
+        systemctl stop nginx 2>/dev/null || true
+        fuser -k 80/tcp 2>/dev/null || true
+    fi
+    # В режиме «закрыт» открываем порт 80 в фаерволе только на время проверки Let's Encrypt
+    if [[ $PORT80_MODE == closed ]] && command -v ufw >/dev/null 2>&1; then
+        ufw allow 80/tcp >/dev/null 2>&1 && opened=y
+    fi
+
     certbot certonly --standalone --non-interactive --agree-tos \
         --register-unsafely-without-email -d "$d"
+    rc=$?
+
+    [[ $opened == y ]] && ufw delete allow 80/tcp >/dev/null 2>&1
+    return $rc
 }
 
+# Хуки продления (их подхватывает штатный certbot.timer) зависят от режима порта 80:
+#   open   — nginx занимает порт 80, поэтому на время продления он останавливается;
+#   closed — nginx порт 80 не слушает; на время продления порт открывается в фаерволе и закрывается обратно.
 setup_renewal_hooks() {
-    # Хуки подхватывает штатный certbot.timer
+    local pre=/etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh post=/etc/letsencrypt/renewal-hooks/post/start-nginx.sh
     mkdir -p /etc/letsencrypt/renewal-hooks/{pre,post}
-    printf '#!/bin/sh\nsystemctl stop nginx\n'  > /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh
-    printf '#!/bin/sh\nsystemctl start nginx\n' > /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
-    chmod +x /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
+    if [[ $PORT80_MODE == closed ]]; then
+        printf '#!/bin/sh\n# xpro: порт 80 открыт только на время продления сертификатов\nufw allow 80/tcp >/dev/null 2>&1\n' > "$pre"
+        printf '#!/bin/sh\nufw delete allow 80/tcp >/dev/null 2>&1\n' > "$post"
+    else
+        printf '#!/bin/sh\nsystemctl stop nginx\n'  > "$pre"
+        printf '#!/bin/sh\nsystemctl start nginx\n' > "$post"
+    fi
+    chmod +x "$pre" "$post"
+}
+
+# Вопрос о режиме порта 80 (при установке и из меню)
+ask_port80_mode() {
+    local c
+    say "  Порт 80 (обычный HTTP):" "  Port 80 (plain HTTP):"
+    say "    1) Держать открытым: на нём только переадресация на HTTPS, как у обычного сайта" \
+        "    1) Keep it open: it only redirects to HTTPS, like an ordinary website"
+    say "    2) Держать закрытым: открывать лишь на минуту при выпуске и продлении сертификатов" \
+        "    2) Keep it closed: open it only for a minute when certificates are issued or renewed"
+    while true; do
+        askl c "  Выбор" "  Choice" "$([[ $PORT80_MODE == closed ]] && echo 2 || echo 1)"
+        [[ "$c" =~ ^[12]$ ]] && break
+        msg_wrn "Введите 1 или 2." "Enter 1 or 2."
+    done
+    if [[ "$c" == 2 ]]; then PORT80_MODE="closed"; else PORT80_MODE="open"; fi
+}
+
+# Смена режима порта 80 на работающем сервере
+action_port80() {
+    load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
+    local before="$PORT80_MODE"
+    section "Порт 80" "Port 80"
+    if [[ $PORT80_MODE == closed ]]; then
+        say "  Сейчас: \e[1;33mзакрыт\e[0m, открывается только на время продления сертификатов" \
+            "  Now: \e[1;33mclosed\e[0m, opened only while certificates are renewed"
+    else
+        say "  Сейчас: \e[1;32mоткрыт\e[0m, переадресует на HTTPS" "  Now: \e[1;32mopen\e[0m, redirects to HTTPS"
+    fi
+    ask_port80_mode
+    [[ "$PORT80_MODE" == "$before" ]] && { msg_inf "Режим не изменился." "The mode was not changed."; return; }
+
+    save_state
+    if command -v ufw >/dev/null 2>&1; then
+        if [[ $PORT80_MODE == closed ]]; then ufw delete allow 80/tcp >/dev/null 2>&1
+        else ufw allow 80/tcp >/dev/null 2>&1; fi
+    fi
+    setup_renewal_hooks
+    apply_nginx
+    if [[ $PORT80_MODE == closed ]]; then
+        msg_ok "Порт 80 закрыт. Сертификаты продлеваются сами: порт открывается на время проверки и закрывается обратно." \
+               "Port 80 is closed. Certificates still renew automatically: the port is opened for the check and closed again."
+    else
+        msg_ok "Порт 80 открыт и переадресует на HTTPS." "Port 80 is open and redirects to HTTPS."
+    fi
 }
 
 ###############################################################################
@@ -737,6 +854,10 @@ write_vhost() {
 server {
     listen 127.0.0.1:${WWW_PORT} ssl${H2_LISTEN} proxy_protocol$2;
     listen 127.0.0.1:${TARGET_PORT} ssl${H2_LISTEN}$2;
+    # Fallback для подключений TCP+TLS этого домена: Xray уже снял TLS и отдаёт сюда всё,
+    # что не является его клиентом. Только loopback; отдельные порты для HTTP/1.1 и HTTP/2.
+    listen 127.0.0.1:${FB_H1_PORT}$2;
+    listen 127.0.0.1:${FB_H2_PORT}${H2_LISTEN}$2;
     ${H2_ON}
     server_name $1;
     server_tokens off;
@@ -751,7 +872,7 @@ server {
     # Слушаем 7443/9443, а снаружи 443 — редиректы без порта
     absolute_redirect off;
 
-    root  /var/www/html;
+    root  $(site_dir "$1");
     index index.html;
 $3
     location / { try_files \$uri \$uri/ =404; }
@@ -829,14 +950,21 @@ EOF
 
     # ── http: vhost на каждый домен ──
     NGX_CONF=/etc/nginx/sites-available/xpro.conf
-    cat > "$NGX_CONF" <<EOF
-# Сгенерировано xpro.sh
+    echo "# Сгенерировано xpro.sh" > "$NGX_CONF"
+
+    # Порт 80: в режиме «открыт» — переадресация на HTTPS; в режиме «закрыт» nginx его не слушает вовсе
+    if [[ $PORT80_MODE != closed ]]; then
+        cat >> "$NGX_CONF" <<EOF
 server {
     listen 80 default_server;
     server_name _;
     return 301 https://\$host\$request_uri;
 }
 EOF
+    fi
+
+    # Fallback-порты для подключений TCP+TLS описаны прямо в server{} каждого домена (см. write_vhost):
+    # так посторонний, пришедший на домен подключения, видит заглушку именно этого домена.
 
     # Основной домен: панель, подписка, JSON-подписка, gRPC/XHTTP-подключения
     # GeoIP-защита. ВАЖНО: проверка вставляется ТОЛЬКО внутрь location панели и дашборда.
@@ -902,10 +1030,14 @@ EOF
     fi
     main_locations+="$h2_locations"
 
+    # У каждого домена своя заглушка: новым доменам страница подбирается сама, ушедшие — убираются
+    local d
+    for d in "$MAIN_DOMAIN" "$REALITY_DOMAIN" "${sni_domains[@]}"; do ensure_site "$d"; done
+    prune_sites
+
     # Резервный домен — default_server: на чужой SNI отдаём его сертификат, как обычный сайт
     write_vhost "$REALITY_DOMAIN" " default_server" ""
     write_vhost "$MAIN_DOMAIN"    ""                "$main_locations"
-    local d
     for d in "${sni_domains[@]}"; do write_vhost "$d" "" ""; done
 
     ln -sf "$NGX_CONF" /etc/nginx/sites-enabled/xpro.conf
@@ -926,6 +1058,14 @@ site_name() {
         5) echo "403 Access Denied" ;;        6) echo "Coming Soon" ;;
         7) echo "Maintenance" ;;              8) echo "Personal page" ;;
         9) echo "Server default page" ;;     10) echo "Service status" ;;
+        11) echo "Parked domain" ;;          12) echo "Photo portfolio" ;;
+        13) echo "Documentation" ;;          14) echo "Cafe" ;;
+        15) echo "Changelog" ;;              16) echo "Developer page" ;;
+        17) echo "Event" ;;                  18) echo "Open-source project" ;;
+        19) echo "Wiki article" ;;           20) echo "Product landing" ;;
+        21) echo "Team" ;;                   22) echo "FAQ" ;;
+        23) echo "File mirror" ;;            24) echo "Terminal" ;;
+        25) echo "Thank you page" ;;
     esac
 }
 
@@ -1031,54 +1171,321 @@ li:last-child{border:0}li span{color:#16a34a;font-size:.9rem}footer{margin-top:1
 <footer>No incidents reported in the last 30 days.</footer></main></body></html>
 EOF
 ;;
+11) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Domain parked</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#eef2f6;color:#334155;font-family:Arial,Helvetica,sans-serif}
+main{text-align:center;padding:2rem}h1{font-size:1.7rem;margin:0 0 .6rem;color:#0f172a}p{margin:.3rem 0;line-height:1.6}hr{width:60px;border:0;border-top:3px solid #94a3b8;margin:1.4rem auto}</style></head>
+<body><main><h1>This domain is parked</h1><hr><p>The owner has not published a website here yet.</p><p>Managed by __BRAND__.</p></main></body></html>
+EOF
+;;
+12) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — Photography</title>
+<style>body{margin:0;background:#0b0b0c;color:#f4f4f5;font-family:"Helvetica Neue",Arial,sans-serif}header{padding:3rem 1.5rem 1.5rem;text-align:center}
+h1{font-weight:300;letter-spacing:.3em;text-transform:uppercase;font-size:1.3rem;margin:0}p{color:#a1a1aa;font-size:.9rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;max-width:60rem;margin:0 auto;padding:1.5rem}
+.grid div{aspect-ratio:4/3;border-radius:2px}.a{background:linear-gradient(135deg,#3f3f46,#18181b)}.b{background:linear-gradient(135deg,#52525b,#27272a)}
+.c{background:linear-gradient(135deg,#71717a,#3f3f46)}footer{text-align:center;color:#52525b;padding:2rem;font-size:.8rem}</style></head>
+<body><header><h1>__BRAND__</h1><p>Landscape and architecture photography</p></header>
+<div class="grid"><div class="a"></div><div class="b"></div><div class="c"></div><div class="b"></div><div class="c"></div><div class="a"></div></div>
+<footer>Portfolio is being updated.</footer></body></html>
+EOF
+;;
+13) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ Docs</title>
+<style>body{margin:0;display:flex;min-height:100vh;color:#1e293b;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+nav{width:15rem;background:#f1f5f9;border-right:1px solid #e2e8f0;padding:1.5rem 1.2rem}nav b{display:block;margin-bottom:1rem}nav a{display:block;color:#475569;padding:.3rem 0;font-size:.95rem}
+main{flex:1;max-width:44rem;padding:2.5rem 2rem}h1{margin:0 0 .5rem}p{line-height:1.7;color:#475569}code{background:#f1f5f9;padding:.15rem .4rem;border-radius:4px;font-size:.9em}
+pre{background:#0f172a;color:#e2e8f0;padding:1rem;border-radius:8px;overflow:auto}@media(max-width:640px){nav{display:none}}</style></head>
+<body><nav><b>__BRAND__ Docs</b><a>Getting started</a><a>Installation</a><a>Configuration</a><a>API reference</a><a>FAQ</a></nav>
+<main><h1>Getting started</h1><p>This guide walks you through the first steps. You will need a recent version of the command line tools installed.</p>
+<pre>$ tool init my-project
+$ cd my-project
+$ tool run</pre><p>Configuration lives in <code>config.yml</code> at the project root.</p></main></body></html>
+EOF
+;;
+14) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — Coffee &amp; Bakery</title>
+<style>body{margin:0;background:#fdf8f3;color:#3b2f2f;font-family:Georgia,"Times New Roman",serif}header{text-align:center;padding:4rem 1rem 2rem}
+h1{font-size:2.6rem;margin:0;font-weight:400}header p{color:#8b6f5a;letter-spacing:.2em;text-transform:uppercase;font-size:.8rem;font-family:Arial,sans-serif}
+main{max-width:34rem;margin:0 auto;padding:1rem 1.5rem 3rem}h2{font-weight:400;border-bottom:1px solid #e7d9cc;padding-bottom:.4rem}
+li{display:flex;justify-content:space-between;padding:.45rem 0;list-style:none}ul{padding:0;margin:0}footer{text-align:center;color:#a08670;padding:2rem;font-family:Arial,sans-serif;font-size:.85rem}</style></head>
+<body><header><h1>__BRAND__</h1><p>Coffee &amp; bakery</p></header><main><h2>Menu</h2><ul>
+<li><span>Espresso</span><span>2.50</span></li><li><span>Flat white</span><span>3.80</span></li><li><span>Cinnamon bun</span><span>3.20</span></li><li><span>Sourdough toast</span><span>5.50</span></li></ul>
+<h2>Hours</h2><p>Monday to Friday 7:30 &ndash; 18:00<br>Saturday 9:00 &ndash; 16:00</p></main><footer>See you soon.</footer></body></html>
+EOF
+;;
+15) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — Changelog</title>
+<style>body{margin:0;background:#fff;color:#111827;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:40rem;margin:0 auto;padding:3rem 1.2rem}
+h1{font-size:1.8rem;margin:0 0 2rem}section{border-left:2px solid #e5e7eb;padding:0 0 1.8rem 1.2rem;position:relative}
+section:before{content:"";position:absolute;left:-7px;top:6px;width:12px;height:12px;border-radius:50%;background:#6366f1}
+h2{margin:0;font-size:1.1rem}time{color:#6b7280;font-size:.85rem}ul{color:#374151;line-height:1.7;padding-left:1.1rem}</style></head>
+<body><main><h1>__BRAND__ changelog</h1>
+<section><h2>Version 2.4</h2><time>this month</time><ul><li>Faster startup on large projects</li><li>Fixed a crash when the config file is empty</li></ul></section>
+<section><h2>Version 2.3</h2><time>last month</time><ul><li>New export format</li><li>Improved error messages</li></ul></section>
+<section><h2>Version 2.2</h2><time>earlier</time><ul><li>Initial public release</li></ul></section></main></body></html>
+EOF
+;;
+16) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hello</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fafafa;color:#222;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+main{max-width:32rem;padding:2rem;line-height:1.8}h1{font-size:1.3rem;margin:0 0 1rem}a{color:#0969da}p{margin:.4rem 0;color:#555}</style></head>
+<body><main><h1>hi, this is __BRAND__</h1><p>i write small tools and sometimes notes about them.</p><p>nothing much here yet &mdash; the site is a work in progress.</p><p>// last updated recently</p></main></body></html>
+EOF
+;;
+17) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ Meetup</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{text-align:center;padding:2rem;max-width:36rem}.d{display:inline-block;background:#f59e0b;color:#0f172a;font-weight:700;padding:.3rem .9rem;border-radius:6px;font-size:.85rem;letter-spacing:.08em}
+h1{font-size:2.4rem;margin:1rem 0 .6rem}p{color:#cbd5e1;line-height:1.7}.row{display:flex;justify-content:center;gap:2rem;margin-top:1.5rem;color:#94a3b8;font-size:.9rem}</style></head>
+<body><main><span class="d">ANNUAL MEETUP</span><h1>__BRAND__ Community Day</h1><p>Talks, workshops and an evening of conversations. Registration opens soon.</p>
+<div class="row"><span>12 talks</span><span>3 workshops</span><span>1 day</span></div></main></body></html>
+EOF
+;;
+18) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — open source</title>
+<style>body{margin:0;background:#fff;color:#1f2328;font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}main{max-width:46rem;margin:0 auto;padding:2.5rem 1.2rem}
+h1{border-bottom:1px solid #d1d9e0;padding-bottom:.4rem}h2{border-bottom:1px solid #d1d9e0;padding-bottom:.3rem;font-size:1.3rem}
+pre{background:#f6f8fa;padding:1rem;border-radius:6px;overflow:auto;font-size:.9rem}p,li{line-height:1.65}.b{display:inline-block;background:#1f883d;color:#fff;border-radius:999px;padding:.1rem .6rem;font-size:.75rem}</style></head>
+<body><main><h1>__BRAND__ <span class="b">stable</span></h1><p>A small command line utility for keeping project files tidy.</p>
+<h2>Install</h2><pre>curl -fsSL https://example.org/install.sh | sh</pre><h2>Features</h2><ul><li>Works without configuration</li><li>Single static binary</li><li>MIT licensed</li></ul></main></body></html>
+EOF
+;;
+19) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lighthouse — __BRAND__ wiki</title>
+<style>body{margin:0;background:#f8f9fa;color:#202122;font-family:sans-serif}header{background:#fff;border-bottom:1px solid #a7d7f9;padding:.8rem 1.5rem;font-weight:bold}
+main{max-width:52rem;margin:1.5rem auto;background:#fff;border:1px solid #a2a9b1;padding:1.5rem 2rem}h1{font-family:Georgia,serif;font-weight:normal;border-bottom:1px solid #a2a9b1;margin:0 0 .8rem}
+p{line-height:1.6}h2{font-family:Georgia,serif;font-weight:normal;border-bottom:1px solid #a2a9b1}.toc{background:#f8f9fa;border:1px solid #a2a9b1;display:inline-block;padding:.6rem 1rem;font-size:.9rem}</style></head>
+<body><header>__BRAND__ wiki</header><main><h1>Lighthouse</h1><p>A <b>lighthouse</b> is a tower designed to emit light and serve as a navigational aid for ships at sea.</p>
+<div class="toc"><b>Contents</b><br>1 History<br>2 Construction<br>3 See also</div><h2>History</h2><p>Before the development of clearly defined ports, mariners were guided by fires built on hilltops.</p>
+<h2>Construction</h2><p>Most towers are built of stone or brick and painted in distinctive patterns to be recognised by day.</p></main></body></html>
+EOF
+;;
+20) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__ — simple team notes</title>
+<style>body{margin:0;background:#fff;color:#0f172a;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}header{display:flex;justify-content:space-between;padding:1.2rem 2rem;font-weight:700}
+header span{color:#64748b;font-weight:400;font-size:.95rem}.hero{text-align:center;padding:5rem 1.5rem 3rem;max-width:42rem;margin:0 auto}
+h1{font-size:2.6rem;line-height:1.15;margin:0 0 1rem}.hero p{color:#475569;font-size:1.15rem;line-height:1.6}.cta{display:inline-block;margin-top:1.5rem;background:#0f172a;color:#fff;padding:.8rem 1.6rem;border-radius:8px}
+.f{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1.5rem;max-width:56rem;margin:0 auto;padding:2rem}.f div{border:1px solid #e2e8f0;border-radius:10px;padding:1.2rem}.f b{display:block;margin-bottom:.4rem}</style></head>
+<body><header>__BRAND__<span>Pricing &middot; Docs &middot; Sign in</span></header><div class="hero"><h1>Notes your whole team can find</h1>
+<p>One place for decisions, meeting notes and how-tos. No folders to maintain.</p><span class="cta">Start free trial</span></div>
+<div class="f"><div><b>Fast search</b>Find any note in milliseconds.</div><div><b>Shared by default</b>Everyone sees the same page.</div><div><b>Works offline</b>Edits sync when you are back.</div></div></body></html>
+EOF
+;;
+21) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>About — __BRAND__</title>
+<style>body{margin:0;background:#f5f5f4;color:#1c1917;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:50rem;margin:0 auto;padding:3rem 1.5rem}
+h1{font-size:2rem;margin:0 0 .5rem}main>p{color:#57534e;line-height:1.7;max-width:36rem}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1.2rem;margin-top:2rem}
+.g div{background:#fff;border-radius:12px;padding:1.4rem;text-align:center}.g i{display:block;width:56px;height:56px;border-radius:50%;margin:0 auto .8rem}
+.x{background:#fbbf24}.y{background:#34d399}.z{background:#60a5fa}.w{background:#f472b6}.g b{display:block}.g span{color:#78716c;font-size:.85rem}</style></head>
+<body><main><h1>About __BRAND__</h1><p>We are a small remote team building tools for people who like their work to stay simple.</p>
+<div class="g"><div><i class="x"></i><b>Alex</b><span>Engineering</span></div><div><i class="y"></i><b>Sam</b><span>Design</span></div><div><i class="z"></i><b>Robin</b><span>Support</span></div><div><i class="w"></i><b>Kim</b><span>Operations</span></div></div></main></body></html>
+EOF
+;;
+22) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Help centre — __BRAND__</title>
+<style>body{margin:0;background:#fff;color:#111827;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#f3f4f6;text-align:center;padding:3rem 1rem}
+h1{margin:0;font-size:1.9rem}header p{color:#6b7280}main{max-width:42rem;margin:0 auto;padding:2rem 1.2rem}details{border-bottom:1px solid #e5e7eb;padding:1rem 0}
+summary{cursor:pointer;font-weight:600}details p{color:#4b5563;line-height:1.65;margin:.7rem 0 0}</style></head>
+<body><header><h1>Help centre</h1><p>Answers to common questions about __BRAND__</p></header><main>
+<details open><summary>How do I reset my password?</summary><p>Open the sign-in page, choose &ldquo;Forgot password&rdquo; and follow the link we send to your email.</p></details>
+<details><summary>Can I change my plan later?</summary><p>Yes. Plans can be changed at any time from the billing page.</p></details>
+<details><summary>Where is my data stored?</summary><p>Data is stored in regional data centres and backed up daily.</p></details>
+<details><summary>How do I contact support?</summary><p>Use the contact form in your account. We usually reply within one working day.</p></details></main></body></html>
+EOF
+;;
+23) cat <<'EOF'
+<!doctype html><html><head><meta charset="utf-8"><title>Index of /pub/</title>
+<style>body{font-family:monospace;margin:1.5rem;color:#000;background:#fff}h1{font-size:1.4rem;margin:0 0 .6rem}hr{border:0;border-top:1px solid #999}pre{margin:.4rem 0;line-height:1.55}a{color:#00e}</style></head>
+<body><h1>Index of /pub/</h1><hr><pre><a href="../">../</a>
+<a>README.txt</a>                                         14-Mar-2025 09:12                 842
+<a>SHA256SUMS</a>                                         14-Mar-2025 09:12                 312
+<a>release-notes.txt</a>                                  14-Mar-2025 09:10                4521
+<a>archive/</a>                                           02-Feb-2025 17:40                   -
+</pre><hr></body></html>
+EOF
+;;
+24) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__BRAND__</title>
+<style>body{margin:0;min-height:100vh;background:#0c0c0c;color:#33ff66;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:2rem;box-sizing:border-box}
+p{margin:.25rem 0;line-height:1.6}.d{color:#1f9c40}.c{display:inline-block;width:.6em;height:1.1em;background:#33ff66;vertical-align:text-bottom;animation:b 1s steps(1) infinite}@keyframes b{50%{opacity:0}}</style></head>
+<body><p class="d"># __BRAND__ node</p><p>$ uptime</p><p class="d">up 41 days, load average: 0.08, 0.05, 0.01</p><p>$ cat motd</p><p class="d">Nothing to see here. Have a nice day.</p><p>$ <span class="c"></span></p></body></html>
+EOF
+;;
+25) cat <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Thank you — __BRAND__</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#ecfdf5;color:#064e3b;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{text-align:center;padding:2rem;max-width:30rem}.k{width:72px;height:72px;border-radius:50%;background:#10b981;color:#fff;display:grid;place-items:center;font-size:2.2rem;margin:0 auto 1.2rem}
+h1{margin:0 0 .5rem;font-size:1.8rem}p{color:#047857;line-height:1.65}</style></head>
+<body><main><div class="k">&#10003;</div><h1>Thank you</h1><p>Your request has been received. The __BRAND__ team will get back to you shortly.</p></main></body></html>
+EOF
+;;
     esac
 }
 
-# Случайная встроенная заглушка → /var/www/html/index.html.
-# Уже выпадавшие номера записываются: пока не перебраны все десять, страницы на сервере не повторяются.
+# ─── Заглушки по доменам ─────────────────────────────────────────────────────
+# У каждого домена сервера — своя страница: два домена одного сервера не должны выглядеть
+# как один и тот же сайт. Какая страница на каком домене, записано в $SITES_MAP
+# (файл лежит вне папок сайтов: его нельзя скачать по ссылке).
+
+# site_dir ДОМЕН → папка сайта этого домена
+site_dir() {
+    if [[ "$1" == "${MAIN_DOMAIN:-}" ]]; then echo "/var/www/html"; else echo "${SITES_ROOT}/$1"; fi
+}
+
+site_get() { awk -F'\t' -v d="$1" '$1 == d { print $2; exit }' "$SITES_MAP" 2>/dev/null; }
+
+site_set() {      # ДОМЕН НОМЕР|custom
+    local tmp
+    mkdir -p "$STATE_DIR"
+    tmp=$(mktemp)
+    awk -F'\t' -v d="$1" '$1 != d' "$SITES_MAP" 2>/dev/null > "$tmp"
+    printf '%s\t%s\n' "$1" "$2" >> "$tmp"
+    mv -f "$tmp" "$SITES_MAP"
+}
+
+# Все домены сервера, у которых есть сайт: основной, резервный и домены подключений Reality / TCP+TLS
+site_domains() {
+    {
+        echo "${MAIN_DOMAIN:-}"; echo "${REALITY_DOMAIN:-}"
+        [[ -f "$XUIDB" ]] && inbound_routes | awk -F'\t' '$1 == "reality" && $3 != "" { print $3 }'
+    } | awk 'NF && !seen[$0]++'
+}
+
+# install_fake_site [ДОМЕН] — случайная встроенная страница для домена (по умолчанию — основного).
+# Берётся страница, которой нет ни на одном другом домене и которая отличается от текущей.
 install_fake_site() {
-    local used="${STATE_DIR}/site-used" pool=() n last="" brand
+    local dom="${1:-$MAIN_DOMAIN}" dir cur taken pool=() n brand
     local brands=("Northwind Studio" "Aurora Labs" "Bluepeak" "Vertex Digital" "Lumen Works"
                   "Nordic Cloud" "Stonebridge" "Pixelcraft" "Greyline Media" "Summit Systems"
-                  "Harbor and Co" "Silverpine" "Atlas Creative" "Echo Valley" "Brightwave")
-    mkdir -p "$STATE_DIR" /var/www/html
-    [[ -f "$used" ]] && last=$(tail -n 1 "$used" 2>/dev/null)
+                  "Harbor and Co" "Silverpine" "Atlas Creative" "Echo Valley" "Brightwave"
+                  "Maple Systems" "Quiet Harbor" "Ironwood" "Paper Lantern" "Tidewater")
+    dir=$(site_dir "$dom")
+    cur=$(site_get "$dom")
+    taken=" $(awk -F'\t' -v d="$dom" '$1 != d { print $2 }' "$SITES_MAP" 2>/dev/null | tr '\n' ' ')"
 
     for n in $(seq 1 "$SITE_COUNT"); do
-        grep -qx "$n" "$used" 2>/dev/null || pool+=("$n")
+        [[ "$n" != "$cur" && "$taken" != *" $n "* ]] && pool+=("$n")
     done
     if (( ${#pool[@]} == 0 )); then
-        # Все десять уже были — начинаем круг заново, но не с той, что стоит сейчас
-        : > "$used"
-        for n in $(seq 1 "$SITE_COUNT"); do [[ "$n" != "$last" ]] && pool+=("$n"); done
+        # Доменов больше, чем страниц: повтор неизбежен, но хотя бы не та же, что стоит сейчас
+        for n in $(seq 1 "$SITE_COUNT"); do [[ "$n" != "$cur" ]] && pool+=("$n"); done
     fi
     n="${pool[RANDOM % ${#pool[@]}]}"
     brand="${brands[RANDOM % ${#brands[@]}]}"
 
-    rm -rf /var/www/html/*
-    site_template "$n" | sed "s/__BRAND__/${brand}/g" > /var/www/html/index.html
-    if [[ ! -s /var/www/html/index.html ]]; then
-        msg_wrn "Не удалось записать страницу-заглушку." "Failed to write the decoy page."; return 1
+    mkdir -p "$dir"
+    rm -rf "${dir:?}"/*
+    site_template "$n" | sed "s/__BRAND__/${brand}/g" > "${dir}/index.html"
+    if [[ ! -s "${dir}/index.html" ]]; then
+        msg_wrn "Не удалось записать страницу-заглушку для ${dom}." "Failed to write the decoy page for ${dom}."; return 1
     fi
-    echo "$n" >> "$used"
-    echo "builtin-${n}" > "${STATE_DIR}/site"       # отметка лежит вне папки сайта: её нельзя скачать по ссылке
-    chown -R www-data:www-data /var/www/html 2>/dev/null || true
-    msg_ok "Сайт-заглушка: «$(site_name "$n")» (${n} из ${SITE_COUNT})" "Decoy site: «$(site_name "$n")» (${n} of ${SITE_COUNT})"
+    site_set "$dom" "$n"
+    chown -R www-data:www-data "$dir" 2>/dev/null || true
+    msg_ok "Заглушка для ${dom}: «$(site_name "$n")»" "Decoy site for ${dom}: «$(site_name "$n")»"
+}
+
+# ensure_site ДОМЕН — у домена должна быть страница; уже существующую не трогаем
+ensure_site() {
+    local dir old
+    dir=$(site_dir "$1")
+    if [[ -s "${dir}/index.html" ]]; then
+        # Страница есть, но в списке не записана (установка прежней версии) — записываем как есть
+        if [[ -z "$(site_get "$1")" ]]; then
+            old=$(cat "${STATE_DIR}/site" 2>/dev/null)
+            case "$old" in
+                custom)    site_set "$1" custom ;;
+                builtin-*) site_set "$1" "${old#builtin-}" ;;
+                *)         site_set "$1" custom ;;
+            esac
+        fi
+        return 0
+    fi
+    install_fake_site "$1" >/dev/null
+}
+
+# Убираем папки и записи доменов, которых на сервере больше нет
+prune_sites() {
+    local keep d tmp
+    keep=" $(site_domains | tr '\n' ' ')"
+    if [[ -d "$SITES_ROOT" ]]; then
+        for d in "$SITES_ROOT"/*/; do
+            [[ -d "$d" ]] || continue
+            d=$(basename "$d")
+            [[ "$keep" == *" $d "* ]] || rm -rf "${SITES_ROOT:?}/${d}"
+        done
+    fi
+    [[ -f "$SITES_MAP" ]] || return 0
+    tmp=$(mktemp)
+    awk -F'\t' -v k="$keep" 'index(k, " " $1 " ")' "$SITES_MAP" > "$tmp"
+    mv -f "$tmp" "$SITES_MAP"
+}
+
+# site_pick_domain VAR [all] — выбор домена из списка; с «all» добавляется пункт «все сразу»
+site_pick_domain() {
+    local __v="$1" __all="${2:-}" __list=() __d __c __i=0 __cur
+    # Конфигурация Nginx прежней версии отдавала один сайт на все домены — пересобираем её один раз
+    grep -q "$SITES_ROOT" /etc/nginx/sites-available/xpro.conf 2>/dev/null || apply_nginx
+    while read -r __d; do
+        __list+=("$__d"); __i=$((__i + 1))
+        ensure_site "$__d"
+        __cur=$(site_get "$__d")
+        if [[ "$__cur" == custom ]]; then __cur=$(L "свой HTML" "custom HTML"); else __cur="«$(site_name "$__cur")»"; fi
+        printf '  [%d] %-34s %s\n' "$__i" "$__d" "$__cur"
+    done < <(site_domains)
+    [[ -n "$__all" ]] && say "  [a] Все домены сразу" "  [a] All domains at once"
+    while true; do
+        askl __c "  Домен (Enter — отмена)" "  Domain (Enter — cancel)"
+        [[ -z "$__c" ]] && return 1
+        if [[ -n "$__all" && "$__c" == [aAаА] ]]; then printf -v "$__v" '%s' "all"; return 0; fi
+        if [[ "$__c" =~ ^[0-9]+$ ]] && (( __c >= 1 && __c <= ${#__list[@]} )); then
+            printf -v "$__v" '%s' "${__list[$((__c - 1))]}"; return 0
+        fi
+        msg_wrn "Введите номер из списка." "Enter a number from the list."
+    done
 }
 
 # Смена заглушки из меню: свой HTML случайной страницей без спроса не затираем
 action_site_random() {
-    if [[ "$(cat "${STATE_DIR}/site" 2>/dev/null)" == custom ]]; then
-        confirml "Сейчас стоит ваш собственный HTML. Заменить его случайной встроенной страницей?" \
-                 "Your own HTML is currently installed. Replace it with a random built-in page?" n || return
+    load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
+    local dom d
+    section "Сменить сайт-заглушку" "Change the decoy site"
+    site_pick_domain dom all || return
+    if [[ "$dom" == all ]]; then
+        while read -r d; do
+            [[ "$(site_get "$d")" == custom ]] && continue      # свои страницы массовая смена не трогает
+            install_fake_site "$d"
+        done < <(site_domains)
+        return
     fi
-    install_fake_site
+    if [[ "$(site_get "$dom")" == custom ]]; then
+        confirml "На этом домене стоит ваш собственный HTML. Заменить его встроенной страницей?" \
+                 "This domain has your own HTML. Replace it with a built-in page?" n || return
+    fi
+    install_fake_site "$dom"
 }
 
 # Свой HTML для заглушки: редактор, вставка текста или готовый файл
 action_site_custom() {
-    local c tmp src dst=/var/www/html/index.html
+    load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
+    local c tmp src dom dst
     section "Свой HTML для заглушки" "Custom HTML for the decoy site"
+    site_pick_domain dom || return
+    dst="$(site_dir "$dom")/index.html"
     say "  [1] Открыть текущую страницу в редакторе nano" "  [1] Open the current page in the nano editor"
     say "  [2] Вставить HTML-код текстом" "  [2] Paste HTML code as text"
     say "  [3] Взять готовый файл с сервера" "  [3] Use a file that is already on the server"
@@ -1123,15 +1530,15 @@ action_site_custom() {
         fi
     fi
 
-    mkdir -p "$STATE_DIR" /var/www/html
+    mkdir -p "$STATE_DIR" "$(dirname "$dst")"
     [[ -f "$dst" ]] && cp -f "$dst" "${STATE_DIR}/site-prev.html"     # прежняя страница — на случай ошибки
     install -m 644 "$tmp" "$dst"
     rm -f "$tmp"
     chown www-data:www-data "$dst" 2>/dev/null || true
-    echo "custom" > "${STATE_DIR}/site"
-    msg_ok "Своя страница установлена: https://${MAIN_DOMAIN:-домен}/" "Your page is installed: https://${MAIN_DOMAIN:-domain}/"
-    say "  Прежняя страница сохранена в ${STATE_DIR}/site-prev.html. Картинки и стили кладите рядом, в /var/www/html/." \
-        "  The previous page is saved in ${STATE_DIR}/site-prev.html. Put images and styles next to it, in /var/www/html/."
+    site_set "$dom" custom
+    msg_ok "Своя страница установлена: https://${dom}/" "Your page is installed: https://${dom}/"
+    say "  Прежняя страница сохранена в ${STATE_DIR}/site-prev.html. Картинки и стили кладите рядом, в $(dirname "$dst")/." \
+        "  The previous page is saved in ${STATE_DIR}/site-prev.html. Put images and styles next to it, in $(dirname "$dst")/."
 }
 
 ###############################################################################
@@ -1315,7 +1722,7 @@ action_geoip() {
     local c ip
     while true; do
         echo
-        say "\e[1;36m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;36m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
+        say "\e[1;38;5;214m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;38;5;214m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
         geoip_status
         echo
         say "  [1] Включить GeoIP-защиту" "  [1] Enable GeoIP protection"
@@ -2152,8 +2559,8 @@ f2b_status() {
     if [[ -n "$F2B_PATH" ]]; then
         local dash_login
         dash_login=$(cut -d: -f1 "$DASH_HTPASSWD" 2>/dev/null | head -1)
-        say "  Дашборд:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (логин: ${dash_login})" \
-            "  Dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (login: ${dash_login})"
+        say "  Дашборд:  \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (логин: ${dash_login})" \
+            "  Dashboard: \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (login: ${dash_login})"
     else
         say "  Дашборд:  \e[1;33mне установлен\e[0m" "  Dashboard: \e[1;33mnot installed\e[0m"
     fi
@@ -2194,7 +2601,7 @@ action_f2b() {
     local c
     while true; do
         echo
-        say "\e[1;36m── Fail2ban и дашборд ──\e[0m" "\e[1;36m── Fail2ban and dashboard ──\e[0m"
+        say "\e[1;38;5;214m── Fail2ban и дашборд ──\e[0m" "\e[1;38;5;214m── Fail2ban and dashboard ──\e[0m"
         f2b_status
         echo
         say "  [1] Установить / обновить Fail2ban и дашборд" "  [1] Install / update Fail2ban and the dashboard"
@@ -2286,7 +2693,8 @@ collect_install_settings() {
 
     # Внутренние порты и секретные пути: наружу видны только https://домен/путь/
     # Старая база (если есть) будет удалена, поэтому её порты и SNI занятыми не считаем
-    USED_PORTS=(22 80 443 "$WWW_PORT" "$TARGET_PORT" "$DASH_PORT"); USED_SNI=()
+    USED_PORTS=(22 80 443 "$WWW_PORT" "$TARGET_PORT" "$DASH_PORT" "$FB_H1_PORT" "$FB_H2_PORT"); USED_SNI=()
+    PORT80_MODE="open"
     F2B_PATH=""; GEOIP_ENABLED="n"
     PANEL_PORT=$(gen_free_port); USED_PORTS+=("$PANEL_PORT")
     SUB_PORT=$(gen_free_port);   USED_PORTS+=("$SUB_PORT")
@@ -2298,6 +2706,7 @@ collect_install_settings() {
     collect_inbounds_loop
 
     echo; msg_inf "── Защита ──" "── Protection ──"
+    ask_port80_mode
     # Fail2ban можно поставить с дашбордом, без него или не ставить вовсе
     local f2b_choice
     INSTALL_F2B=n; INSTALL_DASH=n
@@ -2370,10 +2779,14 @@ setup_firewall() {
         ufw allow "${p}/tcp" >/dev/null
         [[ "$p" != "22" ]] && msg_wrn "SSH слушает нестандартный порт ${p} — он оставлен открытым." "SSH listens on a non-standard port ${p} — it is left open."
     done
-    ufw allow 80/tcp  >/dev/null
+    [[ $PORT80_MODE != closed ]] && ufw allow 80/tcp >/dev/null
     ufw allow 443/tcp >/dev/null
     ufw --force enable >/dev/null
-    msg_ok "UFW: открыты только SSH(${ssh_ports//$'\n'/,}), 80, 443." "UFW: only SSH(${ssh_ports//$'\n'/,}), 80 and 443 are open."
+    if [[ $PORT80_MODE == closed ]]; then
+        msg_ok "UFW: открыты только SSH(${ssh_ports//$'\n'/,}) и 443; порт 80 закрыт." "UFW: only SSH(${ssh_ports//$'\n'/,}) and 443 are open; port 80 is closed."
+    else
+        msg_ok "UFW: открыты только SSH(${ssh_ports//$'\n'/,}), 80, 443." "UFW: only SSH(${ssh_ports//$'\n'/,}), 80 and 443 are open."
+    fi
 }
 
 _arch() {
@@ -2722,7 +3135,11 @@ show_results() {
         else
             say "   Fail2ban: не установлен" "   Fail2ban: not installed"
         fi
-        say "   VPN и подписки доступны из любой страны, наружу открыты только SSH, 80 и 443." "   VPN and subscriptions are reachable from any country; only SSH, 80 and 443 are open."
+        if [[ $PORT80_MODE == closed ]]; then
+            say "   VPN и подписки доступны из любой страны, наружу открыты только SSH и 443 (порт 80 закрыт)." "   VPN and subscriptions are reachable from any country; only SSH and 443 are open (port 80 is closed)."
+        else
+            say "   VPN и подписки доступны из любой страны, наружу открыты только SSH, 80 и 443." "   VPN and subscriptions are reachable from any country; only SSH, 80 and 443 are open."
+        fi
         echo
         say "Подключения:" "Connections:"
         list_inbounds
@@ -2959,6 +3376,10 @@ action_modify() {
     else
         settings=$(jq -r '.settings' <<<"$row")
     fi
+    # Fallback на сайт-заглушку: добавляется для TCP+TLS и убирается при уходе с него
+    local old_sec
+    old_sec=$(jq -r '.security // "none"' <<<"$old_stream" 2>/dev/null)
+    settings=$(settings_with_fallbacks "$settings" "$V_SEC" "$old_sec")
 
     if needs_sni "$V_SEC"; then
         if [[ -n "$old_sni" ]]; then
@@ -2986,6 +3407,7 @@ action_modify() {
         sqlite3 "$XUIDB" "DELETE FROM client_traffics WHERE inbound_id=${id};" 2>/dev/null || true
     fi
     set_host "$id" "$V_SEC" "$sni"
+    set_fallback_rows "$id" "$V_SEC" "$old_sec"
 
     apply_nginx
     restart_xui
@@ -3008,13 +3430,16 @@ action_uninstall() {
 
     systemctl stop nginx 2>/dev/null || true
     apt-get purge -y 'nginx*' 'libnginx-mod-*' >/dev/null 2>&1 || true
-    rm -rf /etc/nginx /var/www/html
+    rm -rf /etc/nginx /var/www/html "$SITES_ROOT"
 
     # Fail2ban, дашборд, GeoIP (конфиги nginx уже удалены вместе с /etc/nginx)
     systemctl stop fail2ban 2>/dev/null || true
     apt-get purge -y fail2ban >/dev/null 2>&1 || true
     rm -rf /etc/fail2ban "$DASH_ROOT"
     rm -f "$DASH_GEN" "$DASH_CRON" "$GEOIP_UPDATER" "$GEOIP_CRON" "$GEOIP_DB" /run/f2b-dash.lock
+
+    # Шифрованный DNS: возвращаем прежние настройки, пока копия resolv.conf ещё лежит в папке состояния
+    [[ -f "$DOT_CONF" ]] && dot_disable
 
     rm -rf "$STATE_DIR"
     rm -f /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh \
@@ -3048,7 +3473,7 @@ action_uninstall() {
 # ГЛАВНОЕ МЕНЮ
 ###############################################################################
 # ─── Заголовок раздела ───────────────────────────────────────────────────────
-section() { echo; echo -e "\e[1;36m── $(L "$@") ──\e[0m"; }
+section() { echo; echo -e "\e[1;38;5;214m── $(L "$@") ──\e[0m"; }
 
 # ─── [1] Показать доступы ────────────────────────────────────────────────────
 # Всё читается из базы панели в момент вызова, поэтому видны и подключения,
@@ -3088,10 +3513,10 @@ action_access() {
     load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
 
     section "Ссылки" "Links"
-    say "  Панель 3x-ui:      \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" \
-        "  3x-ui panel:       \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
-    [[ -n "$F2B_PATH" ]] && say "  Дашборд Fail2ban:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" \
-                                "  Fail2ban dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
+    say "  Панель 3x-ui:      \e[4;37mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" \
+        "  3x-ui panel:       \e[4;37mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
+    [[ -n "$F2B_PATH" ]] && say "  Дашборд Fail2ban:  \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" \
+                                "  Fail2ban dashboard: \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
     say "  Подписка клиента:  https://${MAIN_DOMAIN}/${SUB_PATH}/<id клиента>" \
         "  Client subscription: https://${MAIN_DOMAIN}/${SUB_PATH}/<client id>"
 
@@ -3212,8 +3637,8 @@ user_add() {
     msg_inf "Добавляю клиента..." "Adding the client..."
     if api_call POST "clients/add" "$payload" && api_ok; then
         msg_ok "Клиент ${email} добавлен." "Client ${email} added."
-        say "  Ссылка-подписка: \e[1;34mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m" \
-            "  Subscription link: \e[1;34mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m"
+        say "  Ссылка-подписка: \e[4;37mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m" \
+            "  Subscription link: \e[4;37mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m"
         say "  Для VLESS TCP+Reality при желании включите flow xtls-rprx-vision в панели." \
             "  For VLESS TCP+Reality you may enable flow xtls-rprx-vision in the panel."
     else
@@ -3300,6 +3725,116 @@ action_paths() {
     done
 }
 
+# ─── Шифрованный DNS (DNS over TLS) ──────────────────────────────────────────
+# Обычные DNS-запросы идут открытым текстом: хостинг видит, какие сайты запрашивает сервер
+# (в том числе для VPN-клиентов). DoT шифрует их. Работает через systemd-resolved.
+# Мера необязательная и выключена по умолчанию. Если после включения имена перестают
+# резолвиться (хостинг режет порт 853), настройка сама откатывается.
+dot_resolves() { timeout 10 getent ahostsv4 github.com >/dev/null 2>&1; }
+
+dot_enabled() { [[ -f "$DOT_CONF" ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; }
+
+dot_disable() {
+    rm -f "$DOT_CONF"
+    # Возвращаем прежний resolv.conf, если заменяли его при включении
+    if [[ -f "${STATE_DIR}/resolv.conf.bak" ]]; then
+        rm -f /etc/resolv.conf
+        cp -f "${STATE_DIR}/resolv.conf.bak" /etc/resolv.conf
+        rm -f "${STATE_DIR}/resolv.conf.bak"
+    fi
+    systemctl restart systemd-resolved 2>/dev/null || true
+}
+
+dot_enable() {
+    local c dns name
+    say "  Чей DNS использовать:" "  Which DNS to use:"
+    echo "    1) Cloudflare (1.1.1.1)"
+    echo "    2) Quad9 (9.9.9.9)"
+    echo "    3) Google (8.8.8.8)"
+    while true; do
+        askl c "  Выбор (Enter — отмена)" "  Choice (Enter — cancel)"
+        [[ -z "$c" ]] && return 1
+        [[ "$c" =~ ^[123]$ ]] && break
+        msg_wrn "Введите 1, 2 или 3." "Enter 1, 2 or 3."
+    done
+    case "$c" in
+        1) name="Cloudflare"; dns="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com" ;;
+        2) name="Quad9";      dns="9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net" ;;
+        3) name="Google";     dns="8.8.8.8#dns.google 8.8.4.4#dns.google" ;;
+    esac
+
+    if [[ -z "$(systemctl list-unit-files systemd-resolved.service --no-legend 2>/dev/null)" ]]; then
+        msg_inf "Установка systemd-resolved..." "Installing systemd-resolved..."
+        export DEBIAN_FRONTEND=noninteractive
+        # Копию resolv.conf снимаем ДО установки пакета: он заменяет этот файл своим
+        mkdir -p "$STATE_DIR"
+        [[ -f "${STATE_DIR}/resolv.conf.bak" ]] || cp -fL /etc/resolv.conf "${STATE_DIR}/resolv.conf.bak" 2>/dev/null
+        if ! apt-get install -y systemd-resolved >/dev/null 2>&1; then
+            msg_wrn "Не удалось установить systemd-resolved — шифрованный DNS не включён." \
+                    "Failed to install systemd-resolved — encrypted DNS was not enabled."
+            dot_disable; return 1
+        fi
+    fi
+
+    mkdir -p "$STATE_DIR" "$(dirname "$DOT_CONF")"
+    # Система должна спрашивать имена у systemd-resolved, а не напрямую у DNS хостинга
+    if [[ "$(readlink -f /etc/resolv.conf 2>/dev/null)" != /run/systemd/resolve/* ]]; then
+        [[ -f "${STATE_DIR}/resolv.conf.bak" ]] || cp -fL /etc/resolv.conf "${STATE_DIR}/resolv.conf.bak" 2>/dev/null
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    fi
+    cat > "$DOT_CONF" <<EOF
+# Создано xpro.sh: шифрованный DNS (DNS over TLS), провайдер ${name}
+[Resolve]
+DNS=${dns}
+FallbackDNS=
+Domains=~.
+DNSOverTLS=yes
+EOF
+    systemctl enable systemd-resolved >/dev/null 2>&1
+    systemctl restart systemd-resolved 2>/dev/null
+    sleep 3
+
+    if dot_resolves; then
+        msg_ok "Шифрованный DNS включён (${name}). Запросы сервера идут через DNS over TLS." \
+               "Encrypted DNS is on (${name}). The server's lookups now go over DNS over TLS."
+    else
+        dot_disable
+        msg_wrn "С шифрованным DNS имена перестали резолвиться (скорее всего, хостинг закрыл порт 853) — настройка отменена, DNS работает как раньше." \
+                "Names stopped resolving with encrypted DNS (the host most likely blocks port 853) — the change was reverted, DNS works as before."
+        dot_resolves || msg_wrn "Внимание: DNS не отвечает и после отката. Проверьте /etc/resolv.conf." \
+                                "Warning: DNS does not respond even after the rollback. Check /etc/resolv.conf."
+        return 1
+    fi
+}
+
+action_dot() {
+    local c
+    section "Шифрованный DNS (DNS over TLS)" "Encrypted DNS (DNS over TLS)"
+    if dot_enabled; then
+        say "  Сейчас: \e[1;32mвключён\e[0m ($(sed -n 's/^DNS=//p' "$DOT_CONF"))" \
+            "  Now: \e[1;32mon\e[0m ($(sed -n 's/^DNS=//p' "$DOT_CONF"))"
+    else
+        say "  Сейчас: \e[1;33mвыключен\e[0m — DNS-запросы сервера видны хостингу" \
+            "  Now: \e[1;33moff\e[0m — the server's DNS lookups are visible to the hosting provider"
+    fi
+    say "  Это мера приватности, а не защита от взлома: на панель и подключения она не влияет." \
+        "  This is a privacy measure, not attack protection: the panel and connections are not affected."
+    echo
+    say "  [1] Включить или сменить DNS-провайдера" "  [1] Turn on or change the DNS provider"
+    say "  [2] Выключить" "  [2] Turn off"
+    say "  [0] Назад" "  [0] Back"
+    read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+    case "${c//[[:space:]]/}" in
+        1) dot_enable ;;
+        2) if dot_enabled || [[ -f "$DOT_CONF" ]]; then
+               dot_disable
+               msg_ok "Шифрованный DNS выключен, прежние настройки DNS возвращены." "Encrypted DNS is off, the previous DNS settings are restored."
+           else
+               msg_inf "Он и так выключен." "It is already off."
+           fi ;;
+    esac
+}
+
 # Смена логина и пароля веб-панели 3x-ui штатной командой панели:
 # она сама хеширует пароль так, как этого ждёт её версия.
 action_panel_auth() {
@@ -3364,17 +3899,20 @@ action_settings() {
             say "  [5] Установить свой HTML для заглушки" "  [5] Install your own HTML for the decoy site"
             say "  [6] Сменить секретные пути (панель, дашборд, подписка)" "  [6] Change secret paths (panel, dashboard, subscription)"
             say "  [7] Сменить логин и пароль от панели 3x-ui" "  [7] Change the 3x-ui panel login and password"
+            say "  ── Защита ──" "  ── Protection ──"
+            say "  [8] Порт 80: держать открытым или закрытым" "  [8] Port 80: keep it open or closed"
         fi
-        say "  [8] Fail2ban и дашборд" "  [8] Fail2ban and the dashboard"
-        say "  [9] GeoIP и whitelist" "  [9] GeoIP and whitelist"
-        echo "  [10] Язык / Language"
+        say "  [9] Fail2ban и дашборд" "  [9] Fail2ban and the dashboard"
+        say "  [10] GeoIP и whitelist" "  [10] GeoIP and whitelist"
+        say "  [11] Шифрованный DNS (DNS over TLS)" "  [11] Encrypted DNS (DNS over TLS)"
+        echo "  [12] Язык / Language"
         say "  ── Опасная зона ──" "  ── Danger zone ──"
-        [[ $INSTALLED == y ]] && say "  \e[1;31m[11]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[11]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
-        say "  \e[1;31m[12]\e[0m Полное удаление всего" "  \e[1;31m[12]\e[0m Full removal of everything"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[13]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[13]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[14]\e[0m Полное удаление всего" "  \e[1;31m[14]\e[0m Full removal of everything"
         say "  [0] Назад" "  [0] Back"
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
-        if [[ $INSTALLED == n && "$c" =~ ^([1-7]|11)$ ]]; then
+        if [[ $INSTALLED == n && "$c" =~ ^([1-8]|13)$ ]]; then
             msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
             continue
         fi
@@ -3386,11 +3924,13 @@ action_settings() {
             5)  action_site_custom; pause ;;
             6)  action_paths ;;
             7)  action_panel_auth; pause ;;
-            8)  action_f2b ;;
-            9)  action_geoip ;;
-            10) choose_lang ;;
-            11) action_install; pause; return ;;
-            12) action_uninstall; pause; return ;;
+            8)  action_port80; pause ;;
+            9)  action_f2b ;;
+            10) action_geoip ;;
+            11) action_dot; pause ;;
+            12) choose_lang ;;
+            13) action_install; pause; return ;;
+            14) action_uninstall; pause; return ;;
             0)  return ;;
             "") ;;                                  # пустой Enter — просто показать меню снова
             *)  msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;
@@ -3529,14 +4069,14 @@ BOX_W=64
 box_border() {    # $1 — левый угол, $2 — правый угол
     local line
     printf -v line '%*s' "$BOX_W" ''
-    echo -e "\e[1;36m${1}${line// /═}${2}\e[0m"
+    echo -e "\e[1;38;5;214m${1}${line// /═}${2}\e[0m"
 }
 
 box_line() {      # $1 — текст (по центру), $2 — ANSI-стиль текста
     local t="$1" l r
     l=$(( (BOX_W - ${#t}) / 2 ))
     r=$(( BOX_W - ${#t} - l ))
-    printf '\e[1;36m║\e[0m%*s\e[%sm%s\e[0m%*s\e[1;36m║\e[0m\n' "$l" '' "${2:-0}" "$t" "$r" ''
+    printf '\e[1;38;5;214m║\e[0m%*s\e[%sm%s\e[0m%*s\e[1;38;5;214m║\e[0m\n' "$l" '' "${2:-0}" "$t" "$r" ''
 }
 
 show_menu() {
@@ -3553,7 +4093,7 @@ show_menu() {
     box_border "╔" "╗"
     box_line ""
     box_line "xpro v${XPRO_VERSION} — Secure VPN Deploy" "1;37"
-    box_line "3x-ui · Nginx SNI · Reality · Fail2ban · GeoIP · 443" "0;36"
+    box_line "3x-ui · Nginx SNI · Reality · Fail2ban · GeoIP · 443" "38;5;245"
     box_line ""
     box_border "╚" "╝"
     # Сообщение об установке команды xpro показываем один раз (clear стирает вывод до меню)
@@ -3573,23 +4113,23 @@ show_menu() {
     [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && INSTALLED=y
 
     if [[ $INSTALLED == y ]]; then
-        say "  \e[1;32m[1]\e[0m 🔐 Показать доступы (ссылки, подключения, клиенты)" \
-            "  \e[1;32m[1]\e[0m 🔐 Show access details (links, connections, clients)"
-        say "  \e[1;32m[2]\e[0m 👥 Управление пользователями (добавить / удалить клиента)" \
-            "  \e[1;32m[2]\e[0m 👥 Manage users (add / remove a client)"
+        say "  \e[1;38;5;214m[1]\e[0m 🔐 Показать доступы (ссылки, подключения, клиенты)" \
+            "  \e[1;38;5;214m[1]\e[0m 🔐 Show access details (links, connections, clients)"
+        say "  \e[1;38;5;214m[2]\e[0m 👥 Управление пользователями (добавить / удалить клиента)" \
+            "  \e[1;38;5;214m[2]\e[0m 👥 Manage users (add / remove a client)"
     else
-        say "  \e[1;32m[1]\e[0m 🚀 Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" \
-            "  \e[1;32m[1]\e[0m 🚀 Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
+        say "  \e[1;38;5;214m[1]\e[0m 🚀 Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" \
+            "  \e[1;38;5;214m[1]\e[0m 🚀 Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
     fi
-    say "  \e[1;32m[3]\e[0m 🛠  Настройки сервера (подключения, заглушка, пути, защита, язык / language)" \
-        "  \e[1;32m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language / язык)"
-    say "  \e[1;32m[4]\e[0m 📊 Статус служб (Nginx, 3x-ui, Fail2ban)" \
-        "  \e[1;32m[4]\e[0m 📊 Service status (Nginx, 3x-ui, Fail2ban)"
+    say "  \e[1;38;5;214m[3]\e[0m 🛠  Настройки сервера (подключения, заглушка, пути, защита, язык / language)" \
+        "  \e[1;38;5;214m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language / язык)"
+    say "  \e[1;38;5;214m[4]\e[0m 📊 Статус служб (Nginx, 3x-ui, Fail2ban)" \
+        "  \e[1;38;5;214m[4]\e[0m 📊 Service status (Nginx, 3x-ui, Fail2ban)"
     if [[ -n "$UPDATE_VERSION" ]]; then
         say "  \e[1;33m[5]\e[0m 🔄 Обновить систему и скрипт — доступна версия \e[1;33m${UPDATE_VERSION}\e[0m" \
             "  \e[1;33m[5]\e[0m 🔄 Update the system and script — version \e[1;33m${UPDATE_VERSION}\e[0m is available"
     else
-        say "  \e[1;32m[5]\e[0m 🔄 Обновить систему и скрипт" "  \e[1;32m[5]\e[0m 🔄 Update the system and script"
+        say "  \e[1;38;5;214m[5]\e[0m 🔄 Обновить систему и скрипт" "  \e[1;38;5;214m[5]\e[0m 🔄 Update the system and script"
     fi
     say "  \e[1;37m[0]\e[0m 🚪 Выход" "  \e[1;37m[0]\e[0m 🚪 Exit"
     echo
