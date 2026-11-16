@@ -1498,28 +1498,31 @@ action_site_custom() {
     section "Свой HTML для заглушки" "Custom HTML for the decoy site"
     site_pick_domain dom || return
     dst="$(site_dir "$dom")/index.html"
-    say "  [1] Открыть текущую страницу в редакторе nano" "  [1] Open the current page in the nano editor"
-    say "  [2] Вставить HTML-код текстом" "  [2] Paste HTML code as text"
+    say "  [1] Изменить текущую страницу в nano" "  [1] Edit the current page in nano"
+    say "  [2] Удалить старый HTML и вставить новый в nano (пустой файл)" "  [2] Delete the old HTML and paste a new one in nano (empty file)"
     say "  [3] Взять готовый файл с сервера" "  [3] Use a file that is already on the server"
     say "  [0] Назад" "  [0] Back"
     read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+    c="${c//[[:space:]]/}"
     tmp=$(mktemp)
-    case "${c//[[:space:]]/}" in
-        1)  if ! command -v nano >/dev/null 2>&1; then
+    case "$c" in
+        1|2)
+            if ! command -v nano >/dev/null 2>&1; then
                 msg_inf "Установка редактора nano..." "Installing the nano editor..."
                 apt-get install -y nano >/dev/null 2>&1
             fi
-            [[ -f "$dst" ]] && cp -f "$dst" "$tmp"
-            say "  Сохранение в nano: Ctrl+O, Enter. Выход: Ctrl+X." "  Save in nano: Ctrl+O, Enter. Exit: Ctrl+X."
-            sleep 2
+            # [1] — правка прежней страницы; [2] — пустой файл, куда вставляется новый код целиком.
+            # Старая страница при этом не удаляется сразу: она заменится только после сохранения,
+            # а её копия останется в ${STATE_DIR}/site-prev.html.
+            [[ "$c" == 1 && -f "$dst" ]] && cp -f "$dst" "$tmp"
+            if [[ "$c" == 2 ]]; then
+                say "  Вставка кода: в nano нажмите правую кнопку мыши или Shift+Insert." \
+                    "  Pasting: in nano press the right mouse button or Shift+Insert."
+            fi
+            say "  Сохранить: Ctrl+O, затем Enter. Выйти: Ctrl+X. Выйти без сохранения — страница останется прежней." \
+                "  Save: Ctrl+O, then Enter. Exit: Ctrl+X. Exit without saving — the page stays as it was."
+            read -rp "$(L "  Нажмите Enter, чтобы открыть редактор..." "  Press Enter to open the editor...")" _ || { rm -f "$tmp"; return; }
             if command -v nano >/dev/null 2>&1; then nano "$tmp"; else "${EDITOR:-vi}" "$tmp"; fi ;;
-        2)  say "  Вставьте HTML-код. Чтобы закончить, введите на отдельной строке слово END и нажмите Enter." \
-                "  Paste the HTML code. To finish, type the word END on a separate line and press Enter."
-            local line
-            while IFS= read -r line; do
-                [[ "$line" == END ]] && break
-                printf '%s\n' "$line" >> "$tmp"
-            done ;;
         3)  askl src "Путь к HTML-файлу" "Path to the HTML file"
             if [[ ! -f "$src" ]]; then
                 rm -f "$tmp"; msg_wrn "Файл не найден: ${src}" "File not found: ${src}"; return
