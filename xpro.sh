@@ -90,7 +90,19 @@ LANG_FILE="/etc/xpro-lang"
 L() { if [[ $XLANG == en && -n "${2:-}" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
 
 # say "русский" "english" — echo -e на текущем языке
-say() { echo -e "$(L "$@")"; }
+# Номера пунктов во всех меню и подменю («[1]», «[a]», «1)») и заголовки «── … ──» красятся
+# в зелёный автоматически — так оформление одинаковое везде, и ни один пункт не выпадает.
+# Строки, у которых цвет уже задан явно (например, красные пункты удаления), не трогаются.
+say() {
+    local s re_item='^([[:space:]]*)(\[[0-9]+\]|\[[a-zA-Z]\]|[0-9]+\))(.*)$' re_head='^([[:space:]]*)(──.*──)[[:space:]]*$'
+    s=$(L "$@")
+    if [[ $s =~ $re_item ]]; then
+        s="${BASH_REMATCH[1]}\e[1;32m${BASH_REMATCH[2]}\e[0m${BASH_REMATCH[3]}"
+    elif [[ $s =~ $re_head ]]; then
+        s="${BASH_REMATCH[1]}\e[1;32m${BASH_REMATCH[2]}\e[0m"
+    fi
+    echo -e "$s"
+}
 
 # Все сообщения принимают два аргумента: русский текст и английский
 msg_ok()  { echo -e "\e[1;32m[OK]\e[0m $(L "$@")"; }
@@ -108,8 +120,8 @@ choose_lang() {
     local c
     echo
     echo "  Язык / Language:"
-    echo "    1) Русский"
-    echo "    2) English"
+    say "    1) Русский"
+    say "    2) English"
     read -rp "  [1]: " c
     case "$c" in 2) XLANG="en" ;; *) XLANG="ru" ;; esac
     echo "$XLANG" > "$LANG_FILE" 2>/dev/null
@@ -451,9 +463,9 @@ choose_variant() {
     own=$(L "свой домен и сертификат" "own domain and certificate")
 
     say "  Протокол:" "  Protocol:"
-    echo "    1) VLESS"
-    echo "    2) Trojan"
-    echo "    3) Shadowsocks (2022-blake3-aes-256-gcm)"
+    say "    1) VLESS"
+    say "    2) Trojan"
+    say "    3) Shadowsocks (2022-blake3-aes-256-gcm)"
     while true; do
         askl p "  Выбор" "  Choice" "1"
         [[ "$p" =~ ^[123]$ ]] && break
@@ -463,9 +475,9 @@ choose_variant() {
 
     say "  Транспорт и защита:" "  Transport and security:"
     if [[ $V_PROTO == shadowsocks ]]; then
-        echo "    1) WebSocket + TLS (${via})"
-        echo "    2) gRPC      + TLS (${via})"
-        echo "    3) XHTTP     + TLS (${via})"
+        say "    1) WebSocket + TLS (${via})"
+        say "    2) gRPC      + TLS (${via})"
+        say "    3) XHTTP     + TLS (${via})"
         while true; do
             askl t "  Выбор" "  Choice" "1"
             [[ "$t" =~ ^[123]$ ]] && break
@@ -474,13 +486,13 @@ choose_variant() {
         V_SEC=nginx
         case "$t" in 1) V_NET=ws ;; 2) V_NET=grpc ;; 3) V_NET=xhttp ;; esac
     else
-        echo "    1) TCP       + Reality"
-        echo "    2) gRPC      + Reality"
-        echo "    3) XHTTP     + Reality"
-        echo "    4) TCP       + TLS (${own})"
-        echo "    5) WebSocket + TLS (${via})"
-        echo "    6) gRPC      + TLS (${via})"
-        echo "    7) XHTTP     + TLS (${via})"
+        say "    1) TCP       + Reality"
+        say "    2) gRPC      + Reality"
+        say "    3) XHTTP     + Reality"
+        say "    4) TCP       + TLS (${own})"
+        say "    5) WebSocket + TLS (${via})"
+        say "    6) gRPC      + TLS (${via})"
+        say "    7) XHTTP     + TLS (${via})"
         while true; do
             askl t "  Выбор" "  Choice" "1"
             [[ "$t" =~ ^[1-7]$ ]] && break
@@ -1722,7 +1734,7 @@ action_geoip() {
     local c ip
     while true; do
         echo
-        say "\e[1;36m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;36m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
+        say "\e[1;32m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;32m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
         geoip_status
         echo
         say "  [1] Включить GeoIP-защиту" "  [1] Enable GeoIP protection"
@@ -2601,7 +2613,7 @@ action_f2b() {
     local c
     while true; do
         echo
-        say "\e[1;36m── Fail2ban и дашборд ──\e[0m" "\e[1;36m── Fail2ban and dashboard ──\e[0m"
+        say "\e[1;32m── Fail2ban и дашборд ──\e[0m" "\e[1;32m── Fail2ban and dashboard ──\e[0m"
         f2b_status
         echo
         say "  [1] Установить / обновить Fail2ban и дашборд" "  [1] Install / update Fail2ban and the dashboard"
@@ -3473,7 +3485,7 @@ action_uninstall() {
 # ГЛАВНОЕ МЕНЮ
 ###############################################################################
 # ─── Заголовок раздела ───────────────────────────────────────────────────────
-section() { echo; echo -e "\e[1;36m── $(L "$@") ──\e[0m"; }
+section() { echo; echo -e "\e[1;32m── $(L "$@") ──\e[0m"; }
 
 # ─── [1] Показать доступы ────────────────────────────────────────────────────
 # Всё читается из базы панели в момент вызова, поэтому видны и подключения,
@@ -3748,9 +3760,9 @@ dot_disable() {
 dot_enable() {
     local c dns name
     say "  Чей DNS использовать:" "  Which DNS to use:"
-    echo "    1) Cloudflare (1.1.1.1)"
-    echo "    2) Quad9 (9.9.9.9)"
-    echo "    3) Google (8.8.8.8)"
+    say "    1) Cloudflare (1.1.1.1)"
+    say "    2) Quad9 (9.9.9.9)"
+    say "    3) Google (8.8.8.8)"
     while true; do
         askl c "  Выбор (Enter — отмена)" "  Choice (Enter — cancel)"
         [[ -z "$c" ]] && return 1
@@ -3905,7 +3917,7 @@ action_settings() {
         say "  [9] Fail2ban и дашборд" "  [9] Fail2ban and the dashboard"
         say "  [10] GeoIP и whitelist" "  [10] GeoIP and whitelist"
         say "  [11] Шифрованный DNS (DNS over TLS)" "  [11] Encrypted DNS (DNS over TLS)"
-        echo "  [12] Язык / Language"
+        say "  [12] Язык / Language"
         say "  ── Опасная зона ──" "  ── Danger zone ──"
         [[ $INSTALLED == y ]] && say "  \e[1;31m[13]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[13]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
         say "  \e[1;31m[14]\e[0m Полное удаление всего" "  \e[1;31m[14]\e[0m Full removal of everything"
