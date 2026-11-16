@@ -94,7 +94,7 @@ say() { echo -e "$(L "$@")"; }
 
 # Все сообщения принимают два аргумента: русский текст и английский
 msg_ok()  { echo -e "\e[1;32m[OK]\e[0m $(L "$@")"; }
-msg_inf() { echo -e "\e[38;5;245m[..]\e[0m $(L "$@")"; }
+msg_inf() { echo -e "\e[1;34m[..]\e[0m $(L "$@")"; }
 msg_wrn() { echo -e "\e[1;33m[!!]\e[0m $(L "$@")"; }
 die()     { echo -e "\e[1;31m[$(L "ОШИБКА" "ERROR")]\e[0m $(L "$@")" >&2; exit 1; }
 
@@ -1722,7 +1722,7 @@ action_geoip() {
     local c ip
     while true; do
         echo
-        say "\e[1;37m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;37m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
+        say "\e[1;36m── GeoIP и Whitelist (панель 3x-ui и дашборд) ──\e[0m" "\e[1;36m── GeoIP and Whitelist (3x-ui panel and dashboard) ──\e[0m"
         geoip_status
         echo
         say "  [1] Включить GeoIP-защиту" "  [1] Enable GeoIP protection"
@@ -2559,8 +2559,8 @@ f2b_status() {
     if [[ -n "$F2B_PATH" ]]; then
         local dash_login
         dash_login=$(cut -d: -f1 "$DASH_HTPASSWD" 2>/dev/null | head -1)
-        say "  Дашборд:  \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (логин: ${dash_login})" \
-            "  Dashboard: \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (login: ${dash_login})"
+        say "  Дашборд:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (логин: ${dash_login})" \
+            "  Dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m (login: ${dash_login})"
     else
         say "  Дашборд:  \e[1;33mне установлен\e[0m" "  Dashboard: \e[1;33mnot installed\e[0m"
     fi
@@ -2601,7 +2601,7 @@ action_f2b() {
     local c
     while true; do
         echo
-        say "\e[1;37m── Fail2ban и дашборд ──\e[0m" "\e[1;37m── Fail2ban and dashboard ──\e[0m"
+        say "\e[1;36m── Fail2ban и дашборд ──\e[0m" "\e[1;36m── Fail2ban and dashboard ──\e[0m"
         f2b_status
         echo
         say "  [1] Установить / обновить Fail2ban и дашборд" "  [1] Install / update Fail2ban and the dashboard"
@@ -3473,7 +3473,7 @@ action_uninstall() {
 # ГЛАВНОЕ МЕНЮ
 ###############################################################################
 # ─── Заголовок раздела ───────────────────────────────────────────────────────
-section() { echo; echo -e "\e[1;37m── $(L "$@") ──\e[0m"; }
+section() { echo; echo -e "\e[1;36m── $(L "$@") ──\e[0m"; }
 
 # ─── [1] Показать доступы ────────────────────────────────────────────────────
 # Всё читается из базы панели в момент вызова, поэтому видны и подключения,
@@ -3513,10 +3513,10 @@ action_access() {
     load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
 
     section "Ссылки" "Links"
-    say "  Панель 3x-ui:      \e[4;37mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" \
-        "  3x-ui panel:       \e[4;37mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
-    [[ -n "$F2B_PATH" ]] && say "  Дашборд Fail2ban:  \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" \
-                                "  Fail2ban dashboard: \e[4;37mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
+    say "  Панель 3x-ui:      \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" \
+        "  3x-ui panel:       \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
+    [[ -n "$F2B_PATH" ]] && say "  Дашборд Fail2ban:  \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" \
+                                "  Fail2ban dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
     say "  Подписка клиента:  https://${MAIN_DOMAIN}/${SUB_PATH}/<id клиента>" \
         "  Client subscription: https://${MAIN_DOMAIN}/${SUB_PATH}/<client id>"
 
@@ -3637,8 +3637,8 @@ user_add() {
     msg_inf "Добавляю клиента..." "Adding the client..."
     if api_call POST "clients/add" "$payload" && api_ok; then
         msg_ok "Клиент ${email} добавлен." "Client ${email} added."
-        say "  Ссылка-подписка: \e[4;37mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m" \
-            "  Subscription link: \e[4;37mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m"
+        say "  Ссылка-подписка: \e[1;34mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m" \
+            "  Subscription link: \e[1;34mhttps://${MAIN_DOMAIN}/${SUB_PATH}/${sub}\e[0m"
         say "  Для VLESS TCP+Reality при желании включите flow xtls-rprx-vision в панели." \
             "  For VLESS TCP+Reality you may enable flow xtls-rprx-vision in the panel."
     else
@@ -3889,45 +3889,27 @@ action_settings() {
     [[ $INSTALLED == y ]] && { load_state 2>/dev/null; }
     while true; do
         section "Настройки сервера" "Server settings"
-        MENU_W=18
-
-        # Текущее состояние прямо в пояснении: видно, что включено, не заходя в пункт
-        local p80 geo dot
-        if [[ ${PORT80_MODE:-open} == closed ]]; then p80=$(L "сейчас закрыт" "now closed"); else p80=$(L "сейчас открыт" "now open"); fi
-        if [[ ${GEOIP_ENABLED:-n} == y ]]; then geo=$(L "сейчас включён" "now enabled"); else geo=$(L "сейчас выключен" "now disabled"); fi
-        if dot_enabled; then dot=$(L "сейчас включён" "now enabled"); else dot=$(L "сейчас выключен" "now disabled"); fi
-
         if [[ $INSTALLED == y ]]; then
-            menu_group "Подключения" "Connections"
-            menu_item 1  "$(L "Добавить" "Add")"                "$(L "новое подключение (inbound)" "a new connection (inbound)")"
-            menu_item 2  "$(L "Изменить" "Change")"             "$(L "протокол или транспорт" "protocol or transport")"
-            menu_item 3  "$(L "Удалить" "Delete")"              "$(L "подключение по ID" "a connection by ID")"
-
-            menu_group "Сайт и доступ" "Site and access"
-            menu_item 4  "$(L "Заглушка" "Decoy site")"         "$(L "другая встроенная страница" "another built-in page")"
-            menu_item 5  "$(L "Свой HTML" "Own HTML")"          "$(L "своя страница для домена" "your own page for a domain")"
-            menu_item 6  "$(L "Секретные пути" "Secret paths")" "$(L "панель, дашборд, подписка" "panel, dashboard, subscription")"
-            menu_item 7  "$(L "Логин и пароль" "Login")"        "$(L "вход в панель 3x-ui" "3x-ui panel sign-in")"
+            say "  ── Подключения ──" "  ── Connections ──"
+            say "  [1] Добавить подключение (inbound)" "  [1] Add a connection (inbound)"
+            say "  [2] Изменить подключение (протокол / транспорт)" "  [2] Change a connection (protocol / transport)"
+            say "  [3] Удалить подключение" "  [3] Delete a connection"
+            say "  ── Сервер ──" "  ── Server ──"
+            say "  [4] Сменить сайт-заглушку (по доменам)" "  [4] Change the decoy site (per domain)"
+            say "  [5] Установить свой HTML для заглушки" "  [5] Install your own HTML for the decoy site"
+            say "  [6] Сменить секретные пути (панель, дашборд, подписка)" "  [6] Change secret paths (panel, dashboard, subscription)"
+            say "  [7] Сменить логин и пароль от панели 3x-ui" "  [7] Change the 3x-ui panel login and password"
+            say "  ── Защита ──" "  ── Protection ──"
+            say "  [8] Порт 80: держать открытым или закрытым" "  [8] Port 80: keep it open or closed"
         fi
-
-        menu_group "Защита" "Protection"
-        [[ $INSTALLED == y ]] && \
-        menu_item 8  "$(L "Порт 80" "Port 80")"                 "$(L "открыт или закрыт · " "open or closed · ")${p80}"
-        menu_item 9  "Fail2ban"                                 "$(L "баны и веб-дашборд" "bans and the web dashboard")"
-        menu_item 10 "GeoIP"                                    "$(L "доступ к панели по стране · " "panel access by country · ")${geo}"
-        menu_item 11 "DNS over TLS"                             "$(L "шифрованный DNS · " "encrypted DNS · ")${dot}"
-
-        menu_group "Прочее" "Other"
-        menu_item 12 "Язык / Language"                          "$(L "русский или английский" "English or Russian")"
-
-        menu_group "Опасная зона" "Danger zone"
-        [[ $INSTALLED == y ]] && \
-        menu_item 13 "$(L "Переустановить" "Reinstall")"        "$(L "3x-ui с нуля, база удаляется" "3x-ui from scratch, the database is deleted")" "1;31"
-        menu_item 14 "$(L "Удалить всё" "Remove all")"          "$(L "полное удаление с сервера" "full removal from the server")" "1;31"
-
-        echo
-        menu_item 0  "$(L "Назад" "Back")"
-        echo
+        say "  [9] Fail2ban и дашборд" "  [9] Fail2ban and the dashboard"
+        say "  [10] GeoIP и whitelist" "  [10] GeoIP and whitelist"
+        say "  [11] Шифрованный DNS (DNS over TLS)" "  [11] Encrypted DNS (DNS over TLS)"
+        echo "  [12] Язык / Language"
+        say "  ── Опасная зона ──" "  ── Danger zone ──"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[13]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[13]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[14]\e[0m Полное удаление всего" "  \e[1;31m[14]\e[0m Full removal of everything"
+        say "  [0] Назад" "  [0] Back"
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
         if [[ $INSTALLED == n && "$c" =~ ^([1-8]|13)$ ]]; then
@@ -4099,35 +4081,14 @@ box_line() {      # $1 — текст (по центру), $2 — ANSI-стил�
     printf '\e[%sm║\e[0m%*s\e[%sm%s\e[0m%*s\e[%sm║\e[0m\n' "$HEAD_C" "$l" '' "${2:-0}" "$t" "$r" '' "$HEAD_C"
 }
 
-# ─── Пункты меню в колонках ──────────────────────────────────────────────────
-# Колонки: номер │ название │ пояснение (серым). Ширина считается в символах, а не в байтах,
-# поэтому кириллица выравнивается так же, как латиница.
-MENU_W=18         # ширина колонки названия
-
-menu_item() {     # НОМЕР НАЗВАНИЕ [ПОЯСНЕНИЕ] [ANSI-СТИЛЬ НОМЕРА]
-    local num="[$1]" t="$2" d="${3:-}" st="${4:-1;37}" pad n
-    n=$(( MENU_W - ${#t} )); (( n < 1 )) && n=1
-    printf -v pad '%*s' "$n" ''
-    printf '  \e[%sm%-5s\e[0m %s%s\e[38;5;245m%s\e[0m\n' "$st" "$num" "$t" "$pad" "$d"
-}
-
-menu_group() {    # заголовок группы пунктов: «рус» «eng»
-    echo
-    echo -e "  \e[38;5;250m── $(L "$@") ──\e[0m"
-}
-
-status_row() {    # ПОДПИСЬ ЗНАЧЕНИЕ(с цветом) — строка состояния над меню
-    printf '  %-10s %b\n' "$1" "$2"
-}
-
 show_menu() {
     local status
     if systemctl is-active --quiet x-ui 2>/dev/null; then
-        status="\e[1;32m$(L "работает" "running")\e[0m"
+        status=$(L "работает" "running")
     elif [[ -f "$XUIDB" ]]; then
-        status="\e[1;33m$(L "установлена, остановлена" "installed, stopped")\e[0m"
+        status=$(L "установлен, остановлен" "installed, stopped")
     else
-        status="\e[38;5;245m$(L "не установлена" "not installed")\e[0m"
+        status=$(L "не установлен" "not installed")
     fi
 
     clear 2>/dev/null || true
@@ -4142,37 +4103,37 @@ show_menu() {
         echo -e "  \e[1;32m${XPRO_NOTE}\e[0m"
         XPRO_NOTE=""
     fi
-
-    # Состояние — две колонки: что и в каком оно виде.
-    # Ссылок на панель и дашборд здесь нет: секретные пути не должны светиться на экране
-    # при каждом запуске (скриншоты, чужие глаза). Они показываются только в пункте [1].
-    echo
-    status_row "3x-ui" "$status"
-    if load_state 2>/dev/null && [[ $GEOIP_ENABLED == y ]]; then
-        status_row "GeoIP" "\e[1;32m$(L "включён" "enabled")\e[0m \e[38;5;245m($(L "панель — только ${GEOIP_ALLOW_COUNTRY} и whitelist" "panel — ${GEOIP_ALLOW_COUNTRY} and whitelist only"))\e[0m"
+    say "  Состояние 3x-ui: \e[1;33m${status}\e[0m" "  3x-ui status: \e[1;33m${status}\e[0m"
+    if load_state 2>/dev/null; then
+        # Ссылок на панель и дашборд в шапке нет: секретные пути не должны светиться на экране
+        # при каждом запуске (скриншоты, чужие глаза). Они показываются только в пункте [1].
+        [[ $GEOIP_ENABLED == y ]] && say "  GeoIP:   \e[1;32mвключён\e[0m (панель и дашборд — только ${GEOIP_ALLOW_COUNTRY} и whitelist)" "  GeoIP:     \e[1;32menabled\e[0m (panel and dashboard — only ${GEOIP_ALLOW_COUNTRY} and the whitelist)"
     fi
-
+    echo
     # Пункты про саму панель без установленной 3x-ui не показываем: вместо них — установка.
     INSTALLED=n
     [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && INSTALLED=y
 
-    MENU_W=16
-    menu_group "Меню" "Menu"
     if [[ $INSTALLED == y ]]; then
-        menu_item 1 "$(L "Доступы" "Access")"           "$(L "ссылки, подключения, логины и пароли" "links, connections, logins and passwords")"
-        menu_item 2 "$(L "Пользователи" "Users")"       "$(L "клиенты: добавить, удалить, ссылки" "clients: add, remove, links")"
+        say "  \e[1;32m[1]\e[0m 🔐 Показать доступы (ссылки, подключения, клиенты)" \
+            "  \e[1;32m[1]\e[0m 🔐 Show access details (links, connections, clients)"
+        say "  \e[1;32m[2]\e[0m 👥 Управление пользователями (добавить / удалить клиента)" \
+            "  \e[1;32m[2]\e[0m 👥 Manage users (add / remove a client)"
     else
-        menu_item 1 "$(L "Установка" "Install")"        "$(L "3x-ui с нуля: Nginx, SSL, UFW, база" "3x-ui from scratch: Nginx, SSL, UFW, DB")"
+        say "  \e[1;32m[1]\e[0m 🚀 Установить 3x-ui с нуля (Nginx, SSL, UFW, БД)" \
+            "  \e[1;32m[1]\e[0m 🚀 Install 3x-ui from scratch (Nginx, SSL, UFW, DB)"
     fi
-    menu_item 3 "$(L "Настройки" "Settings")"           "$(L "подключения, сайт, защита, язык / language" "connections, site, protection, language / язык")"
-    menu_item 4 "$(L "Статус" "Status")"                "$(L "службы, порты, сертификаты, проверка" "services, ports, certificates, check")"
+    say "  \e[1;32m[3]\e[0m 🛠  Настройки сервера (подключения, заглушка, пути, защита, язык / language)" \
+        "  \e[1;32m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language / язык)"
+    say "  \e[1;32m[4]\e[0m 📊 Статус служб (Nginx, 3x-ui, Fail2ban)" \
+        "  \e[1;32m[4]\e[0m 📊 Service status (Nginx, 3x-ui, Fail2ban)"
     if [[ -n "$UPDATE_VERSION" ]]; then
-        menu_item 5 "$(L "Обновления" "Updates")"       "$(L "доступна версия ${UPDATE_VERSION}" "version ${UPDATE_VERSION} is available")" "1;33"
+        say "  \e[1;33m[5]\e[0m 🔄 Обновить систему и скрипт — доступна версия \e[1;33m${UPDATE_VERSION}\e[0m" \
+            "  \e[1;33m[5]\e[0m 🔄 Update the system and script — version \e[1;33m${UPDATE_VERSION}\e[0m is available"
     else
-        menu_item 5 "$(L "Обновления" "Updates")"       "$(L "скрипт, панель, система, GeoIP" "script, panel, system, GeoIP")"
+        say "  \e[1;32m[5]\e[0m 🔄 Обновить систему и скрипт" "  \e[1;32m[5]\e[0m 🔄 Update the system and script"
     fi
-    echo
-    menu_item 0 "$(L "Выход" "Exit")"
+    say "  \e[1;37m[0]\e[0m 🚪 Выход" "  \e[1;37m[0]\e[0m 🚪 Exit"
     echo
 }
 
