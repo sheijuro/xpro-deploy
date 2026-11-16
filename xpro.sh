@@ -3889,7 +3889,6 @@ action_settings() {
     [[ $INSTALLED == y ]] && { load_state 2>/dev/null; }
     while true; do
         section "Настройки сервера" "Server settings"
-        MENU_W=18
 
         # Текущее состояние прямо в пояснении: видно, что включено, не заходя в пункт
         local p80 geo dot
@@ -3925,8 +3924,9 @@ action_settings() {
         menu_item 13 "$(L "Переустановить" "Reinstall")"        "$(L "3x-ui с нуля, база удаляется" "3x-ui from scratch, the database is deleted")" "1;31"
         menu_item 14 "$(L "Удалить всё" "Remove all")"          "$(L "полное удаление с сервера" "full removal from the server")" "1;31"
 
-        echo
-        menu_item 0  "$(L "Назад" "Back")"
+        menu_group "Выход" "Exit"
+        menu_item 0  "$(L "Назад" "Back")"                     "$(L "в главное меню" "to the main menu")"
+        menu_end
         echo
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
@@ -4082,7 +4082,7 @@ action_updates() {
 
 # ─── Рамка шапки меню ────────────────────────────────────────────────────────
 # Ширина считается программно (в символах, локаль UTF-8), поэтому рамка всегда ровная.
-BOX_W=64
+BOX_W=74          # = ширина таблицы меню (TBL_NUM + TBL_TTL + TBL_DSC + 6), чтобы шапка и меню совпадали
 
 box_border() {    # $1 — левый угол, $2 — правый угол
     local line
@@ -4097,21 +4097,63 @@ box_line() {      # $1 — текст (по центру), $2 — ANSI-стил�
     printf '\e[1;36m║\e[0m%*s\e[%sm%s\e[0m%*s\e[1;36m║\e[0m\n' "$l" '' "${2:-0}" "$t" "$r" ''
 }
 
-# ─── Пункты меню в колонках ──────────────────────────────────────────────────
-# Колонки: номер │ название │ пояснение (серым). Ширина считается в символах, а не в байтах,
-# поэтому кириллица выравнивается так же, как латиница.
-MENU_W=18         # ширина колонки названия
+# ─── Меню в виде таблицы ─────────────────────────────────────────────────────
+# Колонки: номер │ название │ пояснение. Каждый пункт отделён тонкой линией, группы пунктов —
+# строкой-заголовком. Ширина таблицы совпадает с шапкой. Длина текста считается в символах,
+# а не в байтах, поэтому кириллица выравнивается так же, как латиница.
+TBL_NUM=5         # колонка номера
+TBL_TTL=16        # колонка названия (без отступов)
+TBL_DSC=47        # колонка пояснения (без отступов)
+TBL_B='\e[38;5;240m'   # цвет линий
+TBL_PREV=""       # тип предыдущей строки: "" (начало), row или head
 
-menu_item() {     # НОМЕР НАЗВАНИЕ [ПОЯСНЕНИЕ] [ANSI-СТИЛЬ НОМЕРА]
-    local num="[$1]" t="$2" d="${3:-}" st="${4:-1;37}" pad n
-    n=$(( MENU_W - ${#t} )); (( n < 1 )) && n=1
-    printf -v pad '%*s' "$n" ''
-    printf '  \e[%sm%-5s\e[0m %s%s\e[38;5;245m%s\e[0m\n' "$st" "$num" "$t" "$pad" "$d"
+tbl_hline() {     # ЛЕВЫЙ_УГОЛ СТЫК1 СТЫК2 ПРАВЫЙ_УГОЛ
+    local a b c
+    printf -v a '%*s' "$TBL_NUM" ''
+    printf -v b '%*s' $(( TBL_TTL + 2 )) ''
+    printf -v c '%*s' $(( TBL_DSC + 2 )) ''
+    echo -e "${TBL_B}$1${a// /─}$2${b// /─}$3${c// /─}$4\e[0m"
 }
 
-menu_group() {    # заголовок группы пунктов: «рус» «eng»
-    echo
-    echo -e "  \e[38;5;250m── $(L "$@") ──\e[0m"
+# Линия перед строкой: стыки колонок зависят от того, какая строка была выше и какая идёт сейчас
+tbl_sep() {
+    case "${TBL_PREV}:$1" in
+        :row)      tbl_hline ┌ ┬ ┬ ┐ ;;
+        :head)     tbl_hline ┌ ─ ─ ┐ ;;
+        row:row)   tbl_hline ├ ┼ ┼ ┤ ;;
+        row:head)  tbl_hline ├ ┴ ┴ ┤ ;;
+        head:row)  tbl_hline ├ ┬ ┬ ┤ ;;
+        head:head) tbl_hline ├ ─ ─ ┤ ;;
+    esac
+    TBL_PREV="$1"
+}
+
+menu_end() {      # нижняя граница таблицы
+    case "$TBL_PREV" in
+        row)  tbl_hline └ ┴ ┴ ┘ ;;
+        head) tbl_hline └ ─ ─ ┘ ;;
+    esac
+    TBL_PREV=""
+}
+
+menu_item() {     # НОМЕР НАЗВАНИЕ [ПОЯСНЕНИЕ] [ANSI-СТИЛЬ НОМЕРА]
+    local num="$1" t="$2" d="${3:-}" st="${4:-1;37}" pt pd
+    (( ${#t} > TBL_TTL )) && t="${t:0:$(( TBL_TTL - 1 ))}…"
+    (( ${#d} > TBL_DSC )) && d="${d:0:$(( TBL_DSC - 1 ))}…"
+    printf -v pt '%*s' $(( TBL_TTL - ${#t} )) ''
+    printf -v pd '%*s' $(( TBL_DSC - ${#d} )) ''
+    tbl_sep row
+    printf "${TBL_B}│\e[0m\e[%sm%3s  \e[0m${TBL_B}│\e[0m %s%s ${TBL_B}│\e[0m \e[38;5;245m%s%s\e[0m ${TBL_B}│\e[0m\n" \
+        "$st" "$num" "$t" "$pt" "$d" "$pd"
+}
+
+menu_group() {    # строка-заголовок группы во всю ширину таблицы: «рус» «eng»
+    local t inner p
+    t=$(L "$@")
+    inner=$(( TBL_NUM + TBL_TTL + TBL_DSC + 6 ))
+    printf -v p '%*s' $(( inner - ${#t} - 1 )) ''
+    tbl_sep head
+    printf "${TBL_B}│\e[0m \e[1;38;5;252m%s\e[0m%s${TBL_B}│\e[0m\n" "$t" "$p"
 }
 
 status_row() {    # ПОДПИСЬ ЗНАЧЕНИЕ(с цветом) — строка состояния над меню
@@ -4154,8 +4196,7 @@ show_menu() {
     INSTALLED=n
     [[ -f "$STATE_FILE" && -f "$XUIDB" ]] && INSTALLED=y
 
-    MENU_W=16
-    menu_group "Меню" "Menu"
+    echo
     if [[ $INSTALLED == y ]]; then
         menu_item 1 "$(L "Доступы" "Access")"           "$(L "ссылки, подключения, логины и пароли" "links, connections, logins and passwords")"
         menu_item 2 "$(L "Пользователи" "Users")"       "$(L "клиенты: добавить, удалить, ссылки" "clients: add, remove, links")"
@@ -4169,8 +4210,8 @@ show_menu() {
     else
         menu_item 5 "$(L "Обновления" "Updates")"       "$(L "скрипт, панель, система, GeoIP" "script, panel, system, GeoIP")"
     fi
-    echo
-    menu_item 0 "$(L "Выход" "Exit")"
+    menu_item 0 "$(L "Выход" "Exit")"                   "$(L "закрыть меню" "close the menu")"
+    menu_end
     echo
 }
 
