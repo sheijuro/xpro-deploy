@@ -2,7 +2,7 @@
 
 [Русский](README.md) | **English**
 
-![version](https://img.shields.io/badge/version-1.4.1-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
+![version](https://img.shields.io/badge/version-1.4.2-blue) ![platform](https://img.shields.io/badge/Debian%20%7C%20Ubuntu-supported-success)
 
 An interactive bash script that installs and manages [3x-ui](https://github.com/MHSanaei/3x-ui) on Debian and Ubuntu.
 
@@ -17,8 +17,10 @@ wget -4 -O xpro.sh https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/x
 After the first run the menu is available from anywhere:
 
 ```bash
-sudo xpro
+xpro
 ```
+
+If the command is not run as root, the script asks for privileges through `sudo` by itself.
 
 The interface language (English or Russian) is chosen on the first run and can be changed in the menu: Server settings → Язык / Language.
 
@@ -71,11 +73,12 @@ Before 3x-ui is installed, item 1 is "Install 3x-ui from scratch" and item 2 is 
 | 4 | Change the decoy site to another built-in page |
 | 5 | Install your own HTML for the decoy site |
 | 6 | Change secret paths (panel, dashboard, subscription) |
-| 7 | Fail2ban and the dashboard |
-| 8 | GeoIP and whitelist |
-| 9 | Язык / Language |
-| 10 | Reinstall 3x-ui from scratch |
-| 11 | Full removal of everything |
+| 7 | Change the 3x-ui panel login and password |
+| 8 | Fail2ban and the dashboard |
+| 9 | GeoIP and whitelist |
+| 10 | Язык / Language |
+| 11 | Reinstall 3x-ui from scratch |
+| 12 | Full removal of everything |
 
 Updates do not touch your data: the 3x-ui database, Nginx and Fail2ban configs and certificates stay as they are. A new script version is checked on request under "Updates", not on every start.
 
@@ -106,7 +109,8 @@ The GeoIP check applies to the panel and the dashboard only. Subscriptions and V
 
 - 🗑️ Reinstall and full removal erase the panel and the database with all clients. Both require typing the word `yes`; on reinstall a copy of the database is saved to `/root/`.
 - 🌍 With GeoIP protection on, the panel will not open from another country unless your IP is whitelisted. You can turn it off over SSH: `sudo xpro` → Server settings → GeoIP.
-- 🔑 Logins and passwords saved at installation are stored in `/root/xpro-summary.txt` and shown by item 1. Passwords are masked by default.
+- 🔑 Logins and passwords saved at installation and when changed from the menu are stored in `/root/xpro-summary.txt` and shown by item 1. Passwords are masked by default.
+- 🙈 Links to the panel and the dashboard are not printed in the menu header — the secret paths are visible only in item 1.
 - 🧹 After changing the decoy site your browser may keep showing the previous page from its cache. Reload with Ctrl+Shift+R or open it in a private window.
 - 🔄 An installation made by version 1.0.0 is not recognised: file names on the server have changed. Remove the old installation and install again.
 
