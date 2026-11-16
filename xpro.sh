@@ -19,14 +19,22 @@
 # Запуск:  sudo bash xpro.sh
 ###############################################################################
 
-[[ $EUID -ne 0 ]] && { echo "Run as root / Запустите от root: sudo bash $0"; exit 1; }
+# Запуск без прав root не ошибка: скрипт сам перезапускает себя через sudo,
+# система штатно спросит пароль пользователя и пустит в меню.
+if [[ $EUID -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo bash "$(readlink -f "$0" 2>/dev/null || echo "$0")" "$@"
+    fi
+    echo "Run as root / Запустите от root: su -c 'bash $0'"
+    exit 1
+fi
 
 # UTF-8 локаль нужна для кириллицы в case-шаблонах и для эмодзи (C.UTF-8 есть в Debian всегда)
 export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.4.1"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.4.2"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -3292,6 +3300,55 @@ action_paths() {
     done
 }
 
+# Смена логина и пароля веб-панели 3x-ui штатной командой панели:
+# она сама хеширует пароль так, как этого ждёт её версия.
+action_panel_auth() {
+    load_state 2>/dev/null || { msg_wrn "Установка не найдена." "Installation not found."; return; }
+    [[ -x "$XUI_DIR/x-ui" ]] || { msg_wrn "3x-ui не установлена." "3x-ui is not installed."; return; }
+
+    local user pass again
+    section "Логин и пароль панели 3x-ui" "3x-ui panel login and password"
+    while true; do
+        askl user "Новый логин панели (Enter — отмена)" "New panel login (Enter — cancel)"
+        [[ -z "$user" ]] && { msg_inf "Отменено." "Cancelled."; return; }
+        [[ "$user" =~ ^[A-Za-z0-9_.-]{3,}$ ]] && break
+        msg_wrn "Логин: минимум 3 символа, латиница/цифры/._-" "Login: at least 3 characters, Latin letters/digits/._-"
+    done
+    while true; do
+        read -rsp "$(L "Новый пароль (не короче 8 символов, Enter — сгенерировать): " "New password (at least 8 characters, Enter — generate): ")" pass || { echo; return; }
+        echo
+        if [[ -z "$pass" ]]; then pass=$(gen_random_string 20); break; fi
+        if (( ${#pass} < 8 )); then msg_wrn "Пароль слишком короткий." "The password is too short."; continue; fi
+        read -rsp "$(L "Повторите пароль: " "Repeat the password: ")" again || { echo; return; }
+        echo
+        [[ "$pass" == "$again" ]] && break
+        msg_wrn "Пароли не совпадают." "Passwords do not match."
+    done
+
+    if ! "$XUI_DIR/x-ui" setting -username "$user" -password "$pass" >/dev/null 2>&1; then
+        msg_wrn "Панель не приняла новые данные — логин и пароль остались прежними." \
+                "The panel rejected the new credentials — login and password are unchanged."
+        return
+    fi
+    restart_xui
+
+    # Дописываем в сводку: её показывает пункт «Показать доступы»
+    {
+        echo
+        say "Панель 3x-ui — обновлено $(date '+%d.%m.%Y %H:%M')" "3x-ui panel — updated $(date '+%d.%m.%Y %H:%M')"
+        say "  Ссылка:  https://${MAIN_DOMAIN}/${PANEL_PATH}/" "  Link:      https://${MAIN_DOMAIN}/${PANEL_PATH}/"
+        say "  Логин:   ${user}" "  Login:     ${user}"
+        echo "$(L "  Пароль:  " "  Password:  ")${pass}"
+    } >> "$SUMMARY_FILE"
+    chmod 600 "$SUMMARY_FILE"
+
+    msg_ok "Логин и пароль панели изменены." "The panel login and password were changed."
+    say "  Логин:  ${user}" "  Login:    ${user}"
+    echo "$(L "  Пароль: " "  Password: ")${pass}"
+    say "  Двухфакторная авторизация, если она включена, осталась как была. Открытые сессии панели попросят войти заново." \
+        "  Two-factor authentication, if enabled, is unchanged. Open panel sessions will ask to sign in again."
+}
+
 action_settings() {
     local c
     [[ $INSTALLED == y ]] && { load_state 2>/dev/null; }
@@ -3306,17 +3363,18 @@ action_settings() {
             say "  [4] Сменить сайт-заглушку (другая встроенная страница)" "  [4] Change the decoy site (another built-in page)"
             say "  [5] Установить свой HTML для заглушки" "  [5] Install your own HTML for the decoy site"
             say "  [6] Сменить секретные пути (панель, дашборд, подписка)" "  [6] Change secret paths (panel, dashboard, subscription)"
+            say "  [7] Сменить логин и пароль от панели 3x-ui" "  [7] Change the 3x-ui panel login and password"
         fi
-        say "  [7] Fail2ban и дашборд" "  [7] Fail2ban and the dashboard"
-        say "  [8] GeoIP и whitelist" "  [8] GeoIP and whitelist"
-        echo "  [9] Язык / Language"
+        say "  [8] Fail2ban и дашборд" "  [8] Fail2ban and the dashboard"
+        say "  [9] GeoIP и whitelist" "  [9] GeoIP and whitelist"
+        echo "  [10] Язык / Language"
         say "  ── Опасная зона ──" "  ── Danger zone ──"
-        [[ $INSTALLED == y ]] && say "  \e[1;31m[10]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[10]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
-        say "  \e[1;31m[11]\e[0m Полное удаление всего" "  \e[1;31m[11]\e[0m Full removal of everything"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[11]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[11]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[12]\e[0m Полное удаление всего" "  \e[1;31m[12]\e[0m Full removal of everything"
         say "  [0] Назад" "  [0] Back"
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
-        if [[ $INSTALLED == n && "$c" =~ ^([1-6]|10)$ ]]; then
+        if [[ $INSTALLED == n && "$c" =~ ^([1-7]|11)$ ]]; then
             msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
             continue
         fi
@@ -3327,11 +3385,12 @@ action_settings() {
             4)  action_site_random; pause ;;
             5)  action_site_custom; pause ;;
             6)  action_paths ;;
-            7)  action_f2b ;;
-            8)  action_geoip ;;
-            9)  choose_lang ;;
-            10) action_install; pause; return ;;
-            11) action_uninstall; pause; return ;;
+            7)  action_panel_auth; pause ;;
+            8)  action_f2b ;;
+            9)  action_geoip ;;
+            10) choose_lang ;;
+            11) action_install; pause; return ;;
+            12) action_uninstall; pause; return ;;
             0)  return ;;
             "") ;;                                  # пустой Enter — просто показать меню снова
             *)  msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;
@@ -3504,8 +3563,8 @@ show_menu() {
     fi
     say "  Состояние 3x-ui: \e[1;33m${status}\e[0m" "  3x-ui status: \e[1;33m${status}\e[0m"
     if load_state 2>/dev/null; then
-        say "  Панель:  \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m" "  Panel:     \e[1;34mhttps://${MAIN_DOMAIN}/${PANEL_PATH}/\e[0m"
-        [[ -n "$F2B_PATH" ]] && say "  Дашборд: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m" "  Dashboard: \e[1;34mhttps://${MAIN_DOMAIN}/${F2B_PATH}/\e[0m"
+        # Ссылок на панель и дашборд в шапке нет: секретные пути не должны светиться на экране
+        # при каждом запуске (скриншоты, чужие глаза). Они показываются только в пункте [1].
         [[ $GEOIP_ENABLED == y ]] && say "  GeoIP:   \e[1;32mвключён\e[0m (панель и дашборд — только ${GEOIP_ALLOW_COUNTRY} и whitelist)" "  GeoIP:     \e[1;32menabled\e[0m (panel and dashboard — only ${GEOIP_ALLOW_COUNTRY} and the whitelist)"
     fi
     echo
@@ -3675,13 +3734,33 @@ if [[ ! -t 0 ]]; then
     echo "xpro: an interactive terminal is required. Save the script to a file and run: sudo bash xpro.sh"
     exit 1
 fi
-# Два одновременных запуска (например, из двух окон SSH) испортили бы базу и конфиги друг другу
-exec 8>/run/xpro.lock
-if ! flock -n 8; then
-    echo "xpro уже запущен в другом окне. Закройте его и повторите."
-    echo "xpro is already running in another session. Close it and try again."
-    exit 1
-fi
+# Два одновременных запуска (например, из двух окон SSH) испортили бы базу и конфиги друг другу.
+# Блокировка — файл с PID. Прежний вариант (flock на открытом дескрипторе) залипал: после обрыва SSH
+# дескриптор продолжали держать дочерние процессы, и скрипт больше не запускался. Теперь при старте
+# проверяется, жив ли записанный процесс и действительно ли это xpro; мёртвая блокировка перехватывается сама.
+LOCK_FILE="/run/xpro.lock"
+
+lock_owner_alive() {      # PID → 0, если этот процесс жив и это xpro (а не чужой процесс с тем же номером)
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$1" 2>/dev/null || return 1
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q 'xpro'
+}
+
+acquire_lock() {
+    local pid
+    pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [[ -n "$pid" && "$pid" != "$$" ]] && lock_owner_alive "$pid"; then
+        echo "xpro уже запущен в другом окне (процесс ${pid}). Закройте его и повторите."
+        echo "Если то окно зависло или потеряно: kill ${pid}"
+        echo "xpro is already running in another session (process ${pid}). Close it and try again."
+        echo "If that session is hung or lost: kill ${pid}"
+        exit 1
+    fi
+    echo "$$" > "$LOCK_FILE"
+    # Снимаем блокировку при любом завершении, но только свою и только из основного процесса
+    trap '[[ $BASHPID == "$$" && "$(cat "$LOCK_FILE" 2>/dev/null)" == "$$" ]] && rm -f "$LOCK_FILE"' EXIT
+}
+acquire_lock
 
 load_lang || choose_lang       # язык спрашивается один раз, при первом запуске
 install_xpro
