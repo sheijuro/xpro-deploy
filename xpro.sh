@@ -809,7 +809,62 @@ fix_http_hash_size() {
 }
 
 # Разовая подготовка nginx.conf (блок stream, модуль, хеши)
+# Наши сайты лежат в /etc/nginx/sites-enabled, дашборд и служебные настройки — в /etc/nginx/conf.d.
+# Стандартный nginx.conf из Debian/Ubuntu подключает обе папки. Но на части серверов nginx.conf
+# нестандартный (образ хостинга, сборка с nginx.org, остатки другой установки): тогда наши файлы
+# молча не загружаются, nginx -t проходит, а снаружи ничего не открывается. В этом случае
+# nginx.conf заменяется на стандартный, прежний сохраняется рядом.
+ensure_nginx_includes() {
+    local f=/etc/nginx/nginx.conf bak
+    if [[ -f "$f" ]] && grep -Eq '^[[:space:]]*include[[:space:]]+/etc/nginx/sites-enabled/' "$f" \
+                     && grep -Eq '^[[:space:]]*include[[:space:]]+/etc/nginx/conf\.d/' "$f"; then
+        return 0
+    fi
+    bak="${f}.xpro-bak.$(date +%s)"
+    [[ -f "$f" ]] && cp -a "$f" "$bak"
+    msg_wrn "nginx.conf не подключает папки сайтов — заменяю его стандартным (прежний: ${bak})." \
+            "nginx.conf does not include the site folders — replacing it with a standard one (previous: ${bak})."
+    mkdir -p /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/stream-enabled /etc/nginx/modules-enabled
+    cat > "$f" <<'EOF'
+# Создано xpro.sh: стандартный nginx.conf. Прежний файл сохранён рядом как nginx.conf.xpro-bak.*
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log;
+include /etc/nginx/modules-enabled/*.conf;
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    server_tokens off;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    access_log /var/log/nginx/access.log;
+    gzip on;
+
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+
+stream {
+    include /etc/nginx/stream-enabled/*.conf;
+}
+EOF
+}
+
 setup_nginx_base() {
+    ensure_nginx_includes
     mkdir -p /etc/nginx/stream-enabled /etc/nginx/conf.d
     grep -q 'stream-enabled' /etc/nginx/nginx.conf \
         || printf '\nstream {\n    include /etc/nginx/stream-enabled/*.conf;\n}\n' >> /etc/nginx/nginx.conf
@@ -895,7 +950,9 @@ EOF
 # Полная пересборка конфигурации nginx из state.env + x-ui.db
 apply_nginx() {
     msg_inf "Сборка конфигурации Nginx..." "Building Nginx configuration..."
-    mkdir -p /etc/nginx/stream-enabled
+    # Каждый раз проверяем основу (nginx.conf, модуль stream, хеши): это быстро и чинит
+    # серверы, где nginx.conf успели заменить или он был нестандартным с самого начала
+    setup_nginx_base
 
     # nginx >= 1.25.1: "http2 on;", старше (Debian 12) — "listen ... http2"
     local ngx_ver
@@ -1057,7 +1114,25 @@ EOF
     nginx -t || die "Проверка конфигурации nginx не пройдена (см. вывод выше)." "nginx configuration check failed (see the output above)."
     systemctl enable nginx >/dev/null 2>&1
     systemctl restart nginx || die "nginx не запустился: journalctl -u nginx -n 50" "nginx did not start: journalctl -u nginx -n 50"
-    msg_ok "Nginx перезапущен." "Nginx restarted."
+
+    # «Перезапущен» ещё не значит «работает как надо»: проверяем, что наши файлы загружены
+    # и nginx действительно слушает нужные порты. Иначе сразу говорим, что именно не так.
+    local dump p miss=""
+    dump=$(nginx -T 2>/dev/null)
+    grep -q '^# configuration file /etc/nginx/sites-enabled/xpro.conf:' <<<"$dump" \
+        || miss+="$(L "конфиг сайтов не загружен" "the site config is not loaded"); "
+    sleep 1
+    for p in 443 "$WWW_PORT" "$TARGET_PORT"; do port_is_listening "$p" || miss+="$(L "порт" "port") ${p}; "; done
+    if [[ -n "$F2B_PATH" && -f "$DASH_NGINX_CONF" ]]; then port_is_listening "$DASH_PORT" || miss+="$(L "порт дашборда" "dashboard port") ${DASH_PORT}; "; fi
+    if [[ -n "$miss" ]]; then
+        msg_wrn "Nginx запущен, но не всё заработало: ${miss}" "Nginx is running, but not everything works: ${miss}"
+        say "  Что nginx сейчас слушает:" "  What nginx is listening on now:"
+        ss -Hltnp 2>/dev/null | grep '"nginx"' | awk '{print "    " $4}' | sort -u
+        say "  Последние ошибки:" "  Recent errors:"
+        tail -n 5 /var/log/nginx/error.log 2>/dev/null | sed 's/^/    /'
+    else
+        msg_ok "Nginx перезапущен." "Nginx restarted."
+    fi
 }
 
 # ─── Сайт-заглушка ───────────────────────────────────────────────────────────
