@@ -4061,6 +4061,117 @@ EOF
     fi
 }
 
+# ─── UDP-трафик клиентов ─────────────────────────────────────────────────────
+# Клиенты отправляют через VPN не только TCP, но и UDP (QUIC у YouTube и Google, звонки, игры).
+# Xray выпускает его в интернет с сервера, поэтому в `ss -ulpn` видны его UDP-сокеты на случайных
+# портах. Это исходящие соединения, снаружи к ним не подключиться. Правило маршрутизации в
+# шаблоне Xray (настройка панели xrayTemplateConfig) может запретить часть или весь такой трафик.
+UDP_PORTS_QUIC="443"
+UDP_PORTS_ALL="1-52,54-65535"        # весь UDP, кроме DNS (53): иначе у части клиентов не откроются сайты
+
+# Шаблон конфигурации Xray. Если его ни разу не сохраняли в панели, она берёт встроенный —
+# восстанавливаем его из рабочего конфига Xray, оставив из входящих только служебный api.
+xray_template_get() {
+    local t
+    t=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='xrayTemplateConfig' LIMIT 1;" 2>/dev/null)
+    if ! jq -e '.routing and .outbounds' <<<"$t" >/dev/null 2>&1; then
+        t=$(jq -c '.inbounds = [(.inbounds // [])[] | select(.tag == "api")]' "$XUI_DIR/bin/config.json" 2>/dev/null)
+    fi
+    jq -e '.routing and .outbounds' <<<"$t" >/dev/null 2>&1 || return 1
+    printf '%s' "$t"
+}
+
+udp_mode() {              # → off | quic | all
+    local t
+    t=$(xray_template_get) || { echo off; return; }
+    jq -r --arg q "$UDP_PORTS_QUIC" --arg a "$UDP_PORTS_ALL" '
+        [.routing.rules[]? | select(.network == "udp" and .outboundTag == "blocked") | .port]
+        | if any(.[]; . == $a) then "all" elif any(.[]; . == $q) then "quic" else "off" end' <<<"$t"
+}
+
+udp_set() {               # off | quic | all
+    local mode="$1" t new ports="" backup="${STATE_DIR}/x-ui.db.before-udp" i
+    t=$(xray_template_get) || {
+        msg_wrn "Не удалось прочитать конфигурацию Xray — ничего не изменено." "Could not read the Xray configuration — nothing was changed."
+        return 1; }
+    case "$mode" in quic) ports="$UDP_PORTS_QUIC" ;; all) ports="$UDP_PORTS_ALL" ;; esac
+
+    # Убираем прежнее правило xpro и, если нужно, ставим новое сразу после служебного правила api
+    new=$(jq --arg p "$ports" --arg q "$UDP_PORTS_QUIC" --arg a "$UDP_PORTS_ALL" '
+        def isapi: ((.inboundTag // []) | if type == "array" then any(.[]; . == "api") else . == "api" end);
+        def ours: (.network == "udp" and .outboundTag == "blocked" and (.port == $q or .port == $a));
+        .outbounds = (if any(.outbounds[]?; .tag == "blocked") then .outbounds
+                      else .outbounds + [{tag:"blocked", protocol:"blackhole", settings:{}}] end)
+        | ([.routing.rules[]? | select(ours | not)]) as $rs
+        | .routing.rules = (if $p == "" then $rs
+              else [$rs[] | select(isapi)] + [{type:"field", network:"udp", port:$p, outboundTag:"blocked"}]
+                   + [$rs[] | select(isapi | not)] end)' <<<"$t") \
+        && jq -e '.routing.rules' <<<"$new" >/dev/null 2>&1 || {
+        msg_wrn "Не удалось собрать новую конфигурацию Xray — ничего не изменено." "Could not build the new Xray configuration — nothing was changed."
+        return 1; }
+
+    mkdir -p "$STATE_DIR"
+    cp -f "$XUIDB" "$backup"
+    if [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE key='xrayTemplateConfig' LIMIT 1;")" ]]; then
+        sqlite3 "$XUIDB" "UPDATE settings SET value='$(sq "$new")' WHERE key='xrayTemplateConfig';"
+    else
+        sqlite3 "$XUIDB" "INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', '$(sq "$new")');"
+    fi || { msg_wrn "Не удалось записать настройку в базу панели." "Could not write the setting to the panel database."; return 1; }
+    restart_xui
+
+    # Панель запущена, но Xray мог не принять конфигурацию — тогда возвращаем как было
+    for i in $(seq 1 10); do pgrep -f 'bin/xray-linux' >/dev/null && break; sleep 1; done
+    if ! pgrep -f 'bin/xray-linux' >/dev/null; then
+        cp -f "$backup" "$XUIDB"
+        restart_xui
+        msg_wrn "Xray не запустился с новым правилом — прежняя настройка возвращена." \
+                "Xray did not start with the new rule — the previous setting is restored."
+        return 1
+    fi
+    return 0
+}
+
+action_udp() {
+    local c cur
+    section "UDP-трафик клиентов" "Client UDP traffic"
+    cur=$(udp_mode)
+    case "$cur" in
+        off)  say "  Сейчас: \e[1;33mразрешён весь UDP\e[0m (как в 3x-ui по умолчанию)" "  Now: \e[1;33mall UDP allowed\e[0m (the 3x-ui default)" ;;
+        quic) say "  Сейчас: \e[1;32mзаблокирован QUIC\e[0m (UDP на порт 443)" "  Now: \e[1;32mQUIC blocked\e[0m (UDP to port 443)" ;;
+        all)  say "  Сейчас: \e[1;32mзаблокирован весь UDP, кроме DNS\e[0m" "  Now: \e[1;32mall UDP blocked except DNS\e[0m" ;;
+    esac
+    say "  Речь об исходящем трафике пользователей VPN: снаружи к серверу по UDP всё равно не подключиться." \
+        "  This is outgoing traffic of VPN users: nobody can connect to the server over UDP from outside anyway."
+    echo
+    say "  [1] Разрешить весь UDP" "  [1] Allow all UDP"
+    say "  [2] Блокировать QUIC — UDP на порт 443 (рекомендуется: сайты сами перейдут на TCP)" \
+        "  [2] Block QUIC — UDP to port 443 (recommended: sites switch to TCP by themselves)"
+    say "  [3] Блокировать весь UDP, кроме DNS (перестанут работать звонки и онлайн-игры)" \
+        "  [3] Block all UDP except DNS (calls and online games will stop working)"
+    say "  [0] Назад" "  [0] Back"
+    read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+    local want=""
+    case "${c//[[:space:]]/}" in
+        1) want=off ;; 2) want=quic ;;
+        3) msg_wrn "Звонки в Telegram, WhatsApp и Discord, онлайн-игры и часть приложений через VPN работать не будут." \
+                   "Calls in Telegram, WhatsApp and Discord, online games and some apps will not work through the VPN."
+           confirml "Всё равно заблокировать весь UDP?" "Block all UDP anyway?" n || return
+           want=all ;;
+        *) return ;;
+    esac
+    [[ "$want" == "$cur" ]] && { msg_inf "Уже так и настроено." "It is already set this way."; return; }
+    msg_inf "Xray перезапустится, у пользователей на пару секунд прервётся соединение." \
+            "Xray will restart, users will lose the connection for a couple of seconds."
+    udp_set "$want" || return
+    case "$want" in
+        off)  msg_ok "Весь UDP разрешён." "All UDP is allowed." ;;
+        quic) msg_ok "QUIC заблокирован. YouTube и сайты Google перейдут на TCP сами." "QUIC is blocked. YouTube and Google sites will switch to TCP by themselves." ;;
+        all)  msg_ok "Весь UDP, кроме DNS, заблокирован." "All UDP except DNS is blocked." ;;
+    esac
+    say "  Правило видно в панели: Настройки Xray → Маршрутизация. Резервная копия базы: ${STATE_DIR}/x-ui.db.before-udp" \
+        "  The rule is visible in the panel: Xray settings → Routing. Database backup: ${STATE_DIR}/x-ui.db.before-udp"
+}
+
 action_dot() {
     local c
     section "Шифрованный DNS (DNS over TLS)" "Encrypted DNS (DNS over TLS)"
@@ -4160,14 +4271,15 @@ action_settings() {
         say "  [10] Fail2ban и дашборд" "  [10] Fail2ban and the dashboard"
         say "  [11] GeoIP и whitelist" "  [11] GeoIP and whitelist"
         say "  [12] Шифрованный DNS (DNS over TLS)" "  [12] Encrypted DNS (DNS over TLS)"
-        say "  [13] Язык / Language"
+        [[ $INSTALLED == y ]] && say "  [13] UDP-трафик клиентов (QUIC)" "  [13] Client UDP traffic (QUIC)"
+        say "  [14] Язык / Language"
         say "  ── Опасная зона ──" "  ── Danger zone ──"
-        [[ $INSTALLED == y ]] && say "  \e[1;31m[14]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[14]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
-        say "  \e[1;31m[15]\e[0m Полное удаление всего" "  \e[1;31m[15]\e[0m Full removal of everything"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[15]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[15]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[16]\e[0m Полное удаление всего" "  \e[1;31m[16]\e[0m Full removal of everything"
         say "  [0] Назад" "  [0] Back"
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
-        if [[ $INSTALLED == n && "$c" =~ ^([1-9]|14)$ ]]; then
+        if [[ $INSTALLED == n && "$c" =~ ^([1-9]|13|15)$ ]]; then
             msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
             continue
         fi
@@ -4184,9 +4296,10 @@ action_settings() {
             10) action_f2b ;;
             11) action_geoip ;;
             12) action_dot; pause ;;
-            13) choose_lang ;;
-            14) action_install; pause; return ;;
-            15) action_uninstall; pause; return ;;
+            13) action_udp; pause ;;
+            14) choose_lang ;;
+            15) action_install; pause; return ;;
+            16) action_uninstall; pause; return ;;
             0)  return ;;
             "") ;;                                  # пустой Enter — просто показать меню снова
             *)  msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;
