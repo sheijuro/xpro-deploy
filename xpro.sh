@@ -34,7 +34,7 @@ export LC_ALL=C.UTF-8
 set -uo pipefail
 
 # ─── Константы ───────────────────────────────────────────────────────────────
-XPRO_VERSION="1.5.0"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
+XPRO_VERSION="1.5.1"     # номер версии: показывается в шапке меню, совпадает с тегом релиза на GitHub
 XUIDB="/etc/x-ui/x-ui.db"
 XUI_DIR="/usr/local/x-ui"
 STATE_DIR="/etc/xpro"
@@ -638,11 +638,15 @@ add_external_proxy() {    # SEC SNI
 }
 
 # Новые панели: запись в таблице hosts
-set_host() {              # INBOUND_ID SEC SNI
+set_host() {              # INBOUND_ID SEC SNI NET
     [[ $HAS_HOSTS == y ]] || return 0
     local id="$1" addr="$MAIN_DOMAIN" sec="tls" fp="$FINGERPRINT" alpn='["h2"]' gid_col="" gid_val=""
     needs_sni "$2" && { addr="$3"; sec="same"; fp=""; alpn='[]'; }
-    [[ "$2" == nginx ]] && alpn='["h2","http/1.1"]'    # WebSocket идёт по HTTP/1.1, gRPC и XHTTP — по h2
+    if [[ "$2" == nginx ]]; then
+        # WebSocket работает только по HTTP/1.1: если клиент предложит h2, nginx выберет его
+        # и рукопожатие WebSocket не состоится. gRPC и XHTTP идут по h2.
+        if [[ "${4:-}" == ws ]]; then alpn='["http/1.1"]'; else alpn='["h2","http/1.1"]'; fi
+    fi
     [[ $HAS_GROUP_ID == y ]] && { gid_col='group_id,'; gid_val="'$(gen_group_id)',"; }
     sqlite3 "$XUIDB" "DELETE FROM hosts WHERE inbound_id=${id};
         INSERT INTO hosts (inbound_id, ${gid_col} sort_order, remark, address, port, security, fingerprint, alpn)
@@ -704,7 +708,7 @@ db_add_inbound() {
         || die "Ошибка добавления подключения на порт ${port}" "Failed to add the connection on port ${port}"
 
     id=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE tag='${tag}';")
-    set_host "$id" "$sec" "$sni"
+    set_host "$id" "$sec" "$sni" "$net"
     set_fallback_rows "$id" "$sec" ""
     msg_ok "Подключение: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})" \
            "Connection: ${remark} → 127.0.0.1:${port} (${proto}, ${net}, ${sec})"
@@ -991,6 +995,12 @@ apply_nginx() {
     # Каждый раз проверяем основу (nginx.conf, модуль stream, хеши): это быстро и чинит
     # серверы, где nginx.conf успели заменить или он был нестандартным с самого начала
     setup_nginx_base
+
+    # Подключения WebSocket, созданные прежними версиями скрипта, предлагали клиенту h2 —
+    # с ним WebSocket через nginx не работает. Исправляем их адрес в подписке на HTTP/1.1.
+    sqlite3 "$XUIDB" "UPDATE hosts SET alpn='[\"http/1.1\"]'
+        WHERE inbound_id IN (SELECT id FROM inbounds WHERE json_extract(stream_settings,'\$.network')='ws')
+          AND security='tls' AND alpn<>'[\"http/1.1\"]';" 2>/dev/null || true
 
     # nginx >= 1.25.1: "http2 on;", старше (Debian 12) — "listen ... http2"
     local ngx_ver
@@ -3650,7 +3660,7 @@ action_modify() {
     if [[ "$V_PROTO" != "$old_proto" ]]; then
         sqlite3 "$XUIDB" "DELETE FROM client_traffics WHERE inbound_id=${id};" 2>/dev/null || true
     fi
-    set_host "$id" "$V_SEC" "$sni"
+    set_host "$id" "$V_SEC" "$sni" "$V_NET"
     set_fallback_rows "$id" "$V_SEC" "$old_sec"
 
     apply_nginx
@@ -4286,7 +4296,10 @@ action_updates() {
         say "  Данные не затрагиваются: база 3x-ui, конфиги Nginx и Fail2ban, сертификаты остаются как есть." \
             "  Your data is not touched: the 3x-ui database, Nginx and Fail2ban configs and certificates stay as they are."
         echo
-        if [[ -n "$UPDATE_VERSION" ]]; then
+        if [[ $UPDATE_KIND == patch ]]; then
+            say "  \e[1;33m[1]\e[0m Установить исправление скрипта xpro (версия ${XPRO_VERSION})" \
+                "  \e[1;33m[1]\e[0m Install a fix for the xpro script (version ${XPRO_VERSION})"
+        elif [[ -n "$UPDATE_VERSION" ]]; then
             say "  \e[1;33m[1]\e[0m Обновить скрипт xpro до ${UPDATE_VERSION} (сейчас ${XPRO_VERSION})" \
                 "  \e[1;33m[1]\e[0m Update the xpro script to ${UPDATE_VERSION} (current ${XPRO_VERSION})"
         else
@@ -4373,7 +4386,10 @@ show_menu() {
         "  \e[1;32m[3]\e[0m 🛠  Server settings (connections, decoy site, paths, protection, language / язык)"
     say "  \e[1;32m[4]\e[0m 📊 Статус служб (Nginx, 3x-ui, Fail2ban)" \
         "  \e[1;32m[4]\e[0m 📊 Service status (Nginx, 3x-ui, Fail2ban)"
-    if [[ -n "$UPDATE_VERSION" ]]; then
+    if [[ $UPDATE_KIND == patch ]]; then
+        say "  \e[1;33m[5]\e[0m 🔄 Обновить систему и скрипт — \e[1;33mдоступно исправление\e[0m" \
+            "  \e[1;33m[5]\e[0m 🔄 Update the system and script — \e[1;33ma fix is available\e[0m"
+    elif [[ -n "$UPDATE_VERSION" ]]; then
         say "  \e[1;33m[5]\e[0m 🔄 Обновить систему и скрипт — доступна версия \e[1;33m${UPDATE_VERSION}\e[0m" \
             "  \e[1;33m[5]\e[0m 🔄 Update the system and script — version \e[1;33m${UPDATE_VERSION}\e[0m is available"
     else
@@ -4417,59 +4433,81 @@ install_xpro() {
 }
 
 # ─── Обновление скрипта ──────────────────────────────────────────────────────
-# При запуске скрипт сверяет свою версию с той, что лежит в репозитории, и только сообщает
-# о новой. Сама замена файла — отдельным пунктом меню и только после подтверждения.
+# Проверка сравнивает установленный скрипт с файлом в репозитории (ветка main):
+#   • номер версии там больше — «доступна новая версия»;
+#   • номер тот же, но файл отличается — «доступно исправление»: так приходят мелкие правки,
+#     ради которых не хочется выпускать отдельную версию;
+#   • файл совпадает — обновлять нечего.
+# Сама замена файла — только по пункту меню и после подтверждения.
 XPRO_UPDATE_URL="https://raw.githubusercontent.com/sheijuro/xpro-deploy/main/xpro.sh"
-UPDATE_VERSION=""          # номер новой версии, если она есть
+UPDATE_VERSION=""          # номер версии в репозитории, если есть что ставить
+UPDATE_KIND=""             # version — новая версия, patch — исправление той же версии
 
 # xpro_fetch КУДА [ТАЙМАУТ] [head] — скачать скрипт из репозитория ("-" = в stdout).
 # С третьим аргументом "head" запрашиваются только первые 8 КБ файла: номер версии стоит
 # в самом начале, а качать весь скрипт ради одной строки на медленном канале незачем.
 xpro_fetch() {
-    local out="$1" t="${2:-5}" part="${3:-}"
+    local out="$1" t="${2:-5}" part="${3:-}" url
+    # GitHub несколько минут отдаёт прежнюю копию файла из кэша. Уникальный хвост адреса
+    # (?t=время) и заголовок no-cache заставляют получить свежую версию сразу после загрузки.
+    url="${XPRO_UPDATE_URL}?t=$(date +%s)"
     if command -v curl >/dev/null 2>&1; then
-        local args=(-fsSL --max-time "$t" -o "$out")
+        local args=(-4 -fsSL --max-time "$t" -H 'Cache-Control: no-cache' -o "$out")
         [[ -n "$part" ]] && args+=(-r 0-8191)
-        curl "${args[@]}" "$XPRO_UPDATE_URL" 2>/dev/null
+        curl "${args[@]}" "$url" 2>/dev/null
     else
-        local args=(-q -T "$t" -t 1 -O "$out")
+        local args=(-4 -q -T "$t" -t 1 --header='Cache-Control: no-cache' -O "$out")
         [[ -n "$part" ]] && args+=(--header="Range: bytes=0-8191")
-        wget "${args[@]}" "$XPRO_UPDATE_URL" 2>/dev/null
+        wget "${args[@]}" "$url" 2>/dev/null
     fi
 }
 
+# Файл, который сейчас работает (установленная команда xpro или запущенный xpro.sh)
+xpro_self() { readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$XPRO_BIN"; }
+
 # check_update [ТАЙМАУТ] — код возврата: 0 — проверка выполнена, 1 — репозиторий не ответил.
-# При сбое сети уже найденная ранее версия не забывается.
+# Скачивается весь файл (около 250 КБ): по нему видно и номер версии, и любые мелкие правки.
 check_update() {
-    local head remote
-    head=$(xpro_fetch - "${1:-5}" head)
-    remote=$(grep -m1 -oP '^XPRO_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' <<<"$head")
-    [[ -n "$remote" ]] || return 1
-    UPDATE_VERSION=""
-    # Новее ли версия в репозитории, чем текущая
+    local tmp remote self
+    tmp=$(mktemp)
+    if ! xpro_fetch "$tmp" "${1:-20}" || ! grep -q '^XPRO_VERSION=' "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    remote=$(grep -m1 -oP '^XPRO_VERSION="\K[0-9]+\.[0-9]+\.[0-9]+' "$tmp")
+    UPDATE_VERSION=""; UPDATE_KIND=""
     if [[ "$remote" != "$XPRO_VERSION" \
           && "$(printf '%s\n' "$XPRO_VERSION" "$remote" | sort -V | tail -1)" == "$remote" ]]; then
-        UPDATE_VERSION="$remote"
+        UPDATE_VERSION="$remote"; UPDATE_KIND="version"
+    elif [[ "$remote" == "$XPRO_VERSION" ]]; then
+        self=$(xpro_self)
+        if [[ -f "$self" ]] && ! cmp -s "$tmp" "$self"; then
+            UPDATE_VERSION="$remote"; UPDATE_KIND="patch"
+        fi
     fi
+    # Версия в репозитории ниже установленной — ничего не предлагаем: это не обновление, а откат
+    rm -f "$tmp"
     return 0
 }
 
 action_update() {
-    # Если новая версия уже найдена при запуске, повторно сеть не дёргаем
-    if [[ -z "$UPDATE_VERSION" ]]; then
-        msg_inf "Проверка обновлений..." "Checking for updates..."
-        if ! check_update 20; then
-            msg_wrn "Репозиторий не ответил — попробуйте ещё раз позже." \
-                    "The repository did not respond — try again later."
-            return
-        fi
-    fi
-    if [[ -z "$UPDATE_VERSION" ]]; then
-        msg_ok "Установлена последняя версия (${XPRO_VERSION})." "You have the latest version (${XPRO_VERSION})."
+    msg_inf "Проверка обновлений..." "Checking for updates..."
+    if ! check_update 30; then
+        msg_wrn "Репозиторий не ответил — попробуйте ещё раз позже." \
+                "The repository did not respond — try again later."
         return
     fi
-    msg_inf "Доступна версия ${UPDATE_VERSION} (у вас ${XPRO_VERSION})." \
-            "Version ${UPDATE_VERSION} is available (you have ${XPRO_VERSION})."
+    if [[ -z "$UPDATE_VERSION" ]]; then
+        msg_ok "Установлена последняя версия (${XPRO_VERSION}), обновлять нечего." \
+               "You have the latest version (${XPRO_VERSION}), nothing to update."
+        return
+    fi
+    if [[ $UPDATE_KIND == patch ]]; then
+        msg_inf "Доступно исправление версии ${XPRO_VERSION}: файл в репозитории изменился, номер версии тот же." \
+                "A fix for version ${XPRO_VERSION} is available: the file in the repository changed, the version number is the same."
+    else
+        msg_inf "Доступна версия ${UPDATE_VERSION} (у вас ${XPRO_VERSION})." \
+                "Version ${UPDATE_VERSION} is available (you have ${XPRO_VERSION})."
+    fi
     confirml "Обновить скрипт? Установленная 3x-ui и её настройки не затрагиваются." \
              "Update the script? The installed 3x-ui and its settings are not affected." y || return
 
@@ -4488,8 +4526,13 @@ action_update() {
     [[ -f "$XPRO_BIN" ]] && cp -a "$XPRO_BIN" "${XPRO_BIN}.bak"
     install -m 755 "$tmp" "$XPRO_BIN"
     rm -f "$tmp"
-    msg_ok "Скрипт обновлён до ${UPDATE_VERSION}. Прежняя версия сохранена в ${XPRO_BIN}.bak. Перезапуск..." \
-           "The script was updated to ${UPDATE_VERSION}. The previous version is kept in ${XPRO_BIN}.bak. Restarting..."
+    if [[ $UPDATE_KIND == patch ]]; then
+        msg_ok "Исправление установлено. Прежний файл сохранён в ${XPRO_BIN}.bak. Перезапуск..." \
+               "The fix is installed. The previous file is kept in ${XPRO_BIN}.bak. Restarting..."
+    else
+        msg_ok "Скрипт обновлён до ${UPDATE_VERSION}. Прежняя версия сохранена в ${XPRO_BIN}.bak. Перезапуск..." \
+               "The script was updated to ${UPDATE_VERSION}. The previous version is kept in ${XPRO_BIN}.bak. Restarting..."
+    fi
     sleep 1
     exec "$XPRO_BIN"
 }
