@@ -245,22 +245,58 @@ inbound_routes() {
         | @tsv'
 }
 
+# padr ТЕКСТ ШИРИНА — текст, дополненный пробелами до ширины в СИМВОЛАХ.
+# printf %-Ns считает байты, поэтому кириллица в колонках разъезжалась.
+padr() {
+    local s="$1" n=$(( $2 - ${#1} ))
+    (( n < 1 )) && n=1
+    printf '%s%*s' "$s" "$n" ''
+}
+
+# Список подключений. Слева — порядковый номер 1, 2, 3…, а не ID из базы: после удаления
+# подключения ID в базе идут с пропусками (1, 2, 4), а номер всегда сплошной.
+# Соответствие «номер → ID в базе» хранится в INB_IDS, им пользуется pick_inbound.
+INB_IDS=()
 list_inbounds() {
-    printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "ID" "$(L "Название" "Name")" "$(L "Порт" "Port")" \
-        "$(L "Протокол" "Protocol")" "$(L "Сеть" "Net")" "$(L "Защита" "Security")"
+    local n=0 id remark port proto net sec
+    INB_IDS=()
+    echo "  $(padr "№" 4)$(padr "$(L "Название" "Name")" 22)$(padr "$(L "Порт" "Port")" 8)$(padr "$(L "Протокол" "Protocol")" 13)$(padr "$(L "Сеть" "Net")" 7)$(L "Защита" "Security")"
+    # Флаги стран в названии превращаются в буквы кода (🇫🇮 → FI): многие терминалы флаги
+    # не рисуют, и из-за них таблица разъезжалась.
     # Подключение, созданное в панели не на 127.0.0.1, через Nginx не идёт и снаружи закрыто фаерволом —
     # оно помечается, чтобы было видно, почему оно не работает.
-    all_inbounds_json | jq -r --arg via "$(L "TLS через nginx" "TLS via nginx")" \
+    while IFS=$'\t' read -r id remark port proto net sec; do
+        [[ -n "$id" ]] || continue
+        n=$((n + 1)); INB_IDS+=("$id")
+        echo "  $(padr "$n" 4)$(padr "$remark" 22)$(padr "$port" 8)$(padr "$proto" 13)$(padr "$net" 7)${sec}"
+    done < <(all_inbounds_json | jq -r --arg via "$(L "TLS через nginx" "TLS via nginx")" \
         --arg ext "$(L "[не на 127.0.0.1 — снаружи недоступно]" "[not on 127.0.0.1 — unreachable from outside]")" '.[]
         | ((.stream_settings | fromjson?) // {}) as $s
-        | [.id, .remark, .port, .protocol, ($s.network // "?"),
+        | [.id,
+           (.remark | explode | map(if . >= 127462 and . <= 127487 then . - 127397 else . end) | implode),
+           .port, .protocol, ($s.network // "?"),
            (if   $s.security == "reality" then "Reality, SNI " + ($s.realitySettings.serverNames[0] // "?")
             elif $s.security == "tls"     then "TLS, SNI " + ($s.tlsSettings.serverName // "?")
             else $via end) + (if .listen != "127.0.0.1" then " " + $ext else "" end)]
-        | @tsv' \
-    | while IFS=$'\t' read -r id remark port proto net sec; do
-        printf '  %-4s %-28s %-7s %-12s %-6s %s\n' "$id" "$remark" "$port" "$proto" "$net" "$sec"
-      done
+        | @tsv')
+    (( n == 0 )) && say "  (подключений нет)" "  (no connections)"
+    return 0
+}
+
+# pick_inbound VAR «вопрос рус» «вопрос eng» — выбор подключения по номеру из list_inbounds.
+# В VAR кладётся настоящий ID из базы. Пустой ввод — отмена (код возврата 1).
+pick_inbound() {
+    local __v="$1" __n
+    while true; do
+        askl __n "$2" "$3"
+        [[ -z "$__n" ]] && { msg_inf "Отменено." "Cancelled."; return 1; }
+        if [[ "$__n" =~ ^[0-9]+$ ]] && (( __n >= 1 && __n <= ${#INB_IDS[@]} )); then
+            printf -v "$__v" '%s' "${INB_IDS[$((__n - 1))]}"
+            return 0
+        fi
+        msg_wrn "Введите номер из первой колонки списка (1–${#INB_IDS[@]})." \
+                "Enter a number from the first column of the list (1–${#INB_IDS[@]})."
+    done
 }
 
 # ─── Занятые порты и SNI ─────────────────────────────────────────────────────
@@ -3360,7 +3396,7 @@ action_add() {
 action_delete() {
     require_install || return
 
-    local total id row remark port proto listen clients=0 bak
+    local total id row remark port proto listen clients=0 bak old_sni
     total=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds;" 2>/dev/null)
     if [[ ! "$total" =~ ^[1-9][0-9]*$ ]]; then
         msg_inf "Подключений нет — удалять нечего." "There are no connections — nothing to delete."
@@ -3368,18 +3404,13 @@ action_delete() {
     fi
 
     say "Подключения:" "Connections:"; list_inbounds; echo
-    while true; do
-        askl id "ID подключения для удаления (Enter — отмена)" "ID of the connection to delete (Enter — cancel)"
-        [[ -z "$id" ]] && { msg_inf "Отменено." "Cancelled."; return; }
-        if [[ ! "$id" =~ ^[0-9]+$ ]]; then
-            msg_wrn "ID — это число из первой колонки списка." "The ID is the number from the first column of the list."; continue
-        fi
-        row=$(all_inbounds_json | jq -c --argjson id "$id" '.[] | select(.id == $id)')
-        [[ -n "$row" ]] && break
-        msg_wrn "Подключения #${id} нет в списке." "There is no connection #${id} in the list."
-    done
+    pick_inbound id "Номер подключения для удаления (Enter — отмена)" "Number of the connection to delete (Enter — cancel)" || return
+    row=$(all_inbounds_json | jq -c --argjson id "$id" '.[] | select(.id == $id)')
+    [[ -n "$row" ]] || { msg_wrn "Подключение не найдено." "Connection not found."; return; }
     remark=$(jq -r '.remark' <<<"$row"); port=$(jq -r '.port' <<<"$row")
     proto=$(jq -r '.protocol' <<<"$row"); listen=$(jq -r '.listen' <<<"$row")
+    # Домен подключения: после удаления он может остаться ничьим — тогда предложим убрать и его
+    old_sni=$(jq -r '(.stream_settings | fromjson? // {}) | .realitySettings.serverNames[0] // .tlsSettings.serverName // empty' <<<"$row" 2>/dev/null)
 
     # Сколько клиентов привязано: в новых версиях панели — отдельная таблица, в старых — список в настройках
     if has_table client_inbounds; then
@@ -3390,12 +3421,12 @@ action_delete() {
     [[ "$clients" =~ ^[0-9]+$ ]] || clients=0
 
     echo
-    say "  Будет удалено: #${id} «${remark}» — ${proto}, ${listen:-*}:${port}, клиентов: ${clients}" \
-        "  To be deleted: #${id} «${remark}» — ${proto}, ${listen:-*}:${port}, clients: ${clients}"
+    say "  Будет удалено: «${remark}» — ${proto}, ${listen:-*}:${port}, клиентов: ${clients}" \
+        "  To be deleted: «${remark}» — ${proto}, ${listen:-*}:${port}, clients: ${clients}"
     (( total == 1 )) && say "  Это последнее подключение: после удаления VPN работать не будет." \
                             "  This is the last connection: VPN will not work after it is deleted."
-    confirm_danger "Подключение #${id} будет удалено без возможности восстановления; у его клиентов этот сервер пропадёт." \
-                   "Connection #${id} will be deleted permanently; this server will disappear for its clients." || return
+    confirm_danger "Подключение «${remark}» будет удалено без возможности восстановления; у его клиентов этот сервер пропадёт." \
+                   "Connection «${remark}» will be deleted permanently; this server will disappear for its clients." || return
 
     bak="/root/x-ui.db.bak.$(date +%s)"
     cp -a "$XUIDB" "$bak" && msg_inf "Копия базы на случай ошибки: ${bak}" "Database copy in case of a mistake: ${bak}"
@@ -3435,8 +3466,129 @@ action_delete() {
     restart_xui
     msg_ok "Готово: «${remark}» удалено, Nginx пересобран, 3x-ui перезапущена." \
            "Done: «${remark}» deleted, Nginx rebuilt, 3x-ui restarted."
-    say "  Сертификат его домена остался на сервере и никому не мешает; клиенты увидят изменение после обновления подписки." \
-        "  The certificate of its domain stays on the server and is harmless; clients see the change after the subscription refreshes."
+    say "  Клиенты увидят изменение после обновления подписки." "  Clients see the change after the subscription refreshes."
+
+    # Домен удалённого подключения больше никем не используется — предлагаем убрать его сертификат
+    if [[ -n "$old_sni" ]] && [[ -z "$(domain_role "$old_sni")" ]] && [[ -d "/etc/letsencrypt/live/${old_sni}" ]]; then
+        echo
+        if confirml "Домен ${old_sni} больше не используется. Удалить его сертификат и сайт-заглушку?" \
+                    "Domain ${old_sni} is no longer used. Delete its certificate and decoy site?" y; then
+            domain_delete "$old_sni"
+        else
+            say "  Оставлен. Убрать его позже: Настройки сервера → Домены и сертификаты." \
+                "  Kept. To remove it later: Server settings → Domains and certificates."
+        fi
+    fi
+}
+
+###############################################################################
+# ДОМЕНЫ И СЕРТИФИКАТЫ
+###############################################################################
+# Домены, на которые на сервере есть сертификаты Let's Encrypt
+cert_domains() {
+    local d
+    for d in /etc/letsencrypt/live/*/; do
+        [[ -f "${d}fullchain.pem" ]] && basename "$d"
+    done
+    return 0
+}
+
+# domain_role ДОМЕН → для чего домен используется (пусто — ни для чего)
+domain_role() {
+    local d="$1" r
+    if [[ "$d" == "${MAIN_DOMAIN:-}" ]]; then L "основной домен: панель, подписка, дашборд" "main domain: panel, subscription, dashboard"; return; fi
+    if [[ "$d" == "${REALITY_DOMAIN:-}" ]]; then L "резервный домен (Reality)" "reserve domain (Reality)"; return; fi
+    [[ -f "$XUIDB" ]] || return 0
+    r=$(all_inbounds_json | jq -r --arg d "$d" '.[] | ((.stream_settings | fromjson?) // {}) as $s
+        | select(($s.realitySettings.serverNames[0] // $s.tlsSettings.serverName // "") == $d)
+        | (.remark | explode | map(if . >= 127462 and . <= 127487 then . - 127397 else . end) | implode)' 2>/dev/null | head -1)
+    [[ -n "$r" ]] && echo "$(L "подключение" "connection") ${r}"
+    return 0
+}
+
+# domain_delete ДОМЕН — сертификат, настройки его продления и папка сайта-заглушки
+domain_delete() {
+    local d="$1"
+    if certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1; then
+        msg_ok "Сертификат ${d} удалён." "Certificate ${d} deleted."
+    else
+        rm -rf "/etc/letsencrypt/live/${d}" "/etc/letsencrypt/archive/${d}" "/etc/letsencrypt/renewal/${d}.conf"
+        msg_ok "Сертификат ${d} удалён вручную." "Certificate ${d} deleted manually."
+    fi
+    prune_sites        # убирает папку сайта и запись домена, которого больше нет на сервере
+}
+
+# domain_dns ДОМЕН → «ok», «нет» или IP, на который домен указывает вместо этого сервера
+domain_dns() {
+    local a
+    a=$(timeout 5 getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
+    if [[ -z "$a" ]]; then echo "none"
+    elif server_ips | grep -qxF "$a"; then echo "ok"
+    else echo "$a"; fi
+}
+
+action_domains() {
+    require_install || return
+    local c d role dns end info doms=() unused=() i
+    while true; do
+        section "Домены и сертификаты" "Domains and certificates"
+        say "  Проверка доменов (DNS и срок сертификата)..." "  Checking domains (DNS and certificate expiry)..."
+        doms=(); unused=(); i=0
+        while read -r d; do
+            [[ -n "$d" ]] || continue
+            i=$((i + 1)); doms+=("$d")
+            role=$(domain_role "$d")
+            end=$(openssl x509 -in "/etc/letsencrypt/live/${d}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+            end=$(date -d "$end" '+%d.%m.%Y' 2>/dev/null || echo "?")
+            dns=$(domain_dns "$d")
+            case "$dns" in
+                ok)   dns="\e[1;32mDNS ok\e[0m" ;;
+                none) dns="\e[1;31m$(L "DNS: не резолвится" "DNS: does not resolve")\e[0m" ;;
+                *)    dns="\e[1;33mDNS → ${dns}\e[0m" ;;
+            esac
+            if [[ -n "$role" ]]; then
+                info="${role}"
+            else
+                info="\e[1;33m$(L "не используется" "not used")\e[0m"
+                unused+=("$d")
+            fi
+            say "  [${i}] $(padr "$d" 34)${info}" "  [${i}] $(padr "$d" 34)${info}"
+            say "      $(L "сертификат до" "certificate until") ${end} · ${dns}" "      $(L "сертификат до" "certificate until") ${end} · ${dns}"
+        done < <(cert_domains)
+        (( i == 0 )) && say "  Сертификатов на сервере нет." "  There are no certificates on the server."
+        echo
+        if (( ${#unused[@]} > 0 )); then
+            say "  Неиспользуемых доменов: ${#unused[@]}. Введите номер домена, чтобы удалить его." \
+                "  Unused domains: ${#unused[@]}. Enter a domain number to delete it."
+            say "  [a] Удалить все неиспользуемые" "  [a] Delete all unused"
+        else
+            say "  Все домены используются — удалять нечего." "  All domains are in use — nothing to delete."
+        fi
+        say "  [0] Назад" "  [0] Back"
+        read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
+        c="${c//[[:space:]]/}"
+        case "$c" in
+            0|"") return ;;
+            a|A|а|А)
+                (( ${#unused[@]} > 0 )) || { msg_inf "Неиспользуемых доменов нет." "There are no unused domains."; continue; }
+                confirm_danger "Будут удалены сертификаты: ${unused[*]}" "Certificates to be deleted: ${unused[*]}" || continue
+                for d in "${unused[@]}"; do domain_delete "$d"; done ;;
+            *)
+                if [[ ! "$c" =~ ^[0-9]+$ ]] || (( c < 1 || c > ${#doms[@]} )); then
+                    msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list."; continue
+                fi
+                d="${doms[$((c - 1))]}"
+                role=$(domain_role "$d")
+                if [[ -n "$role" ]]; then
+                    msg_wrn "Домен ${d} используется (${role}) — его удалять нельзя. Сначала удалите подключение." \
+                            "Domain ${d} is in use (${role}) — it cannot be deleted. Delete the connection first."
+                    continue
+                fi
+                confirm_danger "Сертификат ${d} будет удалён. Вернуть домен можно, добавив подключение с ним заново." \
+                               "Certificate ${d} will be deleted. The domain can be brought back by adding a connection with it again." || continue
+                domain_delete "$d" ;;
+        esac
+    done
 }
 
 ###############################################################################
@@ -3448,10 +3600,10 @@ action_modify() {
 
     say "Подключения:" "Connections:"; list_inbounds; echo
     local id row old_proto old_stream old_sni old_reality settings sni=""
-    askl id "ID подключения для изменения" "ID of the connection to change"
-    [[ "$id" =~ ^[0-9]+$ ]] || { msg_wrn "Некорректный ID." "Invalid ID."; return; }
+    pick_inbound id "Номер подключения для изменения (Enter — отмена)" "Number of the connection to change (Enter — cancel)" || return
     row=$(inbounds_json | jq -c --argjson id "$id" '.[] | select(.id == $id)')
-    [[ -n "$row" ]] || { msg_wrn "Подключение #${id} не найдено." "Connection #${id} not found."; return; }
+    [[ -n "$row" ]] || { msg_wrn "Это подключение создано в панели не на 127.0.0.1 — xpro его не меняет." \
+                                 "This connection was created in the panel not on 127.0.0.1 — xpro does not change it."; return; }
 
     old_proto=$(jq -r '.protocol' <<<"$row")
     old_stream=$(jq -r '.stream_settings' <<<"$row")
@@ -3986,25 +4138,26 @@ action_settings() {
             say "  [1] Добавить подключение (inbound)" "  [1] Add a connection (inbound)"
             say "  [2] Изменить подключение (протокол / транспорт)" "  [2] Change a connection (protocol / transport)"
             say "  [3] Удалить подключение" "  [3] Delete a connection"
+            say "  [4] Домены и сертификаты (проверить, удалить ненужные)" "  [4] Domains and certificates (check, remove unused)"
             say "  ── Сервер ──" "  ── Server ──"
-            say "  [4] Сменить сайт-заглушку (по доменам)" "  [4] Change the decoy site (per domain)"
-            say "  [5] Установить свой HTML для заглушки" "  [5] Install your own HTML for the decoy site"
-            say "  [6] Сменить секретные пути (панель, дашборд, подписка)" "  [6] Change secret paths (panel, dashboard, subscription)"
-            say "  [7] Сменить логин и пароль от панели 3x-ui" "  [7] Change the 3x-ui panel login and password"
+            say "  [5] Сменить сайт-заглушку (по доменам)" "  [5] Change the decoy site (per domain)"
+            say "  [6] Установить свой HTML для заглушки" "  [6] Install your own HTML for the decoy site"
+            say "  [7] Сменить секретные пути (панель, дашборд, подписка)" "  [7] Change secret paths (panel, dashboard, subscription)"
+            say "  [8] Сменить логин и пароль от панели 3x-ui" "  [8] Change the 3x-ui panel login and password"
             say "  ── Защита ──" "  ── Protection ──"
-            say "  [8] Порт 80: держать открытым или закрытым" "  [8] Port 80: keep it open or closed"
+            say "  [9] Порт 80: держать открытым или закрытым" "  [9] Port 80: keep it open or closed"
         fi
-        say "  [9] Fail2ban и дашборд" "  [9] Fail2ban and the dashboard"
-        say "  [10] GeoIP и whitelist" "  [10] GeoIP and whitelist"
-        say "  [11] Шифрованный DNS (DNS over TLS)" "  [11] Encrypted DNS (DNS over TLS)"
-        say "  [12] Язык / Language"
+        say "  [10] Fail2ban и дашборд" "  [10] Fail2ban and the dashboard"
+        say "  [11] GeoIP и whitelist" "  [11] GeoIP and whitelist"
+        say "  [12] Шифрованный DNS (DNS over TLS)" "  [12] Encrypted DNS (DNS over TLS)"
+        say "  [13] Язык / Language"
         say "  ── Опасная зона ──" "  ── Danger zone ──"
-        [[ $INSTALLED == y ]] && say "  \e[1;31m[13]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[13]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
-        say "  \e[1;31m[14]\e[0m Полное удаление всего" "  \e[1;31m[14]\e[0m Full removal of everything"
+        [[ $INSTALLED == y ]] && say "  \e[1;31m[14]\e[0m Переустановить 3x-ui с нуля (база будет удалена)" "  \e[1;31m[14]\e[0m Reinstall 3x-ui from scratch (the database will be deleted)"
+        say "  \e[1;31m[15]\e[0m Полное удаление всего" "  \e[1;31m[15]\e[0m Full removal of everything"
         say "  [0] Назад" "  [0] Back"
         read -rp "$(L "  Выберите пункт: " "  Choose an item: ")" c || return
         c="${c//[[:space:]]/}"
-        if [[ $INSTALLED == n && "$c" =~ ^([1-8]|13)$ ]]; then
+        if [[ $INSTALLED == n && "$c" =~ ^([1-9]|14)$ ]]; then
             msg_wrn "Сначала установите 3x-ui (пункт [1] главного меню)." "Install 3x-ui first (item [1] of the main menu)."
             continue
         fi
@@ -4012,17 +4165,18 @@ action_settings() {
             1)  action_add;    pause ;;
             2)  action_modify; pause ;;
             3)  action_delete; pause ;;
-            4)  action_site_random; pause ;;
-            5)  action_site_custom; pause ;;
-            6)  action_paths ;;
-            7)  action_panel_auth; pause ;;
-            8)  action_port80; pause ;;
-            9)  action_f2b ;;
-            10) action_geoip ;;
-            11) action_dot; pause ;;
-            12) choose_lang ;;
-            13) action_install; pause; return ;;
-            14) action_uninstall; pause; return ;;
+            4)  action_domains ;;
+            5)  action_site_random; pause ;;
+            6)  action_site_custom; pause ;;
+            7)  action_paths ;;
+            8)  action_panel_auth; pause ;;
+            9)  action_port80; pause ;;
+            10) action_f2b ;;
+            11) action_geoip ;;
+            12) action_dot; pause ;;
+            13) choose_lang ;;
+            14) action_install; pause; return ;;
+            15) action_uninstall; pause; return ;;
             0)  return ;;
             "") ;;                                  # пустой Enter — просто показать меню снова
             *)  msg_wrn "Нет пункта «${c}». Введите номер из списка." "There is no item «${c}». Enter a number from the list." ;;

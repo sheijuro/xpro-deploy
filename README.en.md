@@ -73,17 +73,18 @@ Before 3x-ui is installed, item 1 is "Install 3x-ui from scratch" and item 2 is 
 | 1 | Add a connection |
 | 2 | Change a connection (protocol or transport) |
 | 3 | Delete a connection |
-| 4 | Change the decoy site: for a chosen domain or for all at once |
-| 5 | Install your own HTML for the decoy site of a chosen domain |
-| 6 | Change secret paths (panel, dashboard, subscription) |
-| 7 | Change the 3x-ui panel login and password |
-| 8 | Port 80: keep it open or closed |
-| 9 | Fail2ban and the dashboard |
-| 10 | GeoIP and whitelist |
-| 11 | Encrypted DNS (DNS over TLS) |
-| 12 | Язык / Language |
-| 13 | Reinstall 3x-ui from scratch |
-| 14 | Full removal of everything |
+| 4 | Domains and certificates: which are used, DNS, certificate expiry; remove unused ones |
+| 5 | Change the decoy site: for a chosen domain or for all at once |
+| 6 | Install your own HTML for the decoy site of a chosen domain |
+| 7 | Change secret paths (panel, dashboard, subscription) |
+| 8 | Change the 3x-ui panel login and password |
+| 9 | Port 80: keep it open or closed |
+| 10 | Fail2ban and the dashboard |
+| 11 | GeoIP and whitelist |
+| 12 | Encrypted DNS (DNS over TLS) |
+| 13 | Язык / Language |
+| 14 | Reinstall 3x-ui from scratch |
+| 15 | Full removal of everything |
 
 Updates do not touch your data: the 3x-ui database, Nginx and Fail2ban configs and certificates stay as they are. A new script version is checked on request under "Updates", not on every start.
 
