@@ -655,7 +655,9 @@ db_add_inbound() {
     build_stream "$net" "$sec" "$sni"
     add_external_proxy "$sec" "$sni"
     sniffing='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
-    tag="inbound-127.0.0.1:${port}"
+    # Метка в том же виде, что ставит сама панель при создании подключения: in-<порт>-tcp.
+    # По ней подключение видно в маршрутизации Xray (правила «входящий → исходящий»).
+    tag="in-${port}-tcp"
 
     # listen = 127.0.0.1 — inbound недоступен извне даже при выключенном фаерволе
     sqlite3 "$XUIDB" "INSERT INTO inbounds
