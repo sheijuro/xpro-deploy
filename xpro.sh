@@ -2144,7 +2144,7 @@ dash_write_web_files() {
 <meta name="referrer" content="no-referrer">
 <meta name="color-scheme" content="dark">
 <title>Fail2ban</title>
-<link rel="icon" href="data:,">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23000'/%3E%3Cpath d='M16 4 7 7.5v7c0 5.6 3.8 10.6 9 12 5.2-1.4 9-6.4 9-12v-7z' fill='%23052e16' stroke='%2300e676' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='m11.5 16 3 3 6-6.5' fill='none' stroke='%2300e676' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="assets/app.css">
 <script src="assets/app.js" defer></script>
 </head>
